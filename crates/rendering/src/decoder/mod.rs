@@ -1,0 +1,2768 @@
+use ::ffmpeg::Rational;
+use std::{
+    fmt,
+    path::PathBuf,
+    sync::{Arc, Weak, mpsc},
+    time::Duration,
+};
+use tokio::sync::oneshot;
+use tracing::info;
+
+#[cfg(target_os = "macos")]
+use cidre::{arc::R, cv};
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(target_os = "macos")]
+mod avassetreader;
+mod ffmpeg;
+mod frame_converter;
+#[cfg(target_os = "windows")]
+mod media_foundation;
+#[cfg(target_os = "macos")]
+pub mod multi_position;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderType {
+    #[cfg(target_os = "macos")]
+    AVAssetReader,
+    #[cfg(target_os = "windows")]
+    MediaFoundation,
+    FFmpegHardware,
+    FFmpegSoftware,
+}
+
+impl DecoderType {
+    pub fn is_hardware_accelerated(&self) -> bool {
+        match self {
+            #[cfg(target_os = "macos")]
+            DecoderType::AVAssetReader => true,
+            #[cfg(target_os = "windows")]
+            DecoderType::MediaFoundation => true,
+            DecoderType::FFmpegHardware => true,
+            DecoderType::FFmpegSoftware => false,
+        }
+    }
+}
+
+impl fmt::Display for DecoderType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(target_os = "macos")]
+            DecoderType::AVAssetReader => write!(f, "AVAssetReader (hardware)"),
+            #[cfg(target_os = "windows")]
+            DecoderType::MediaFoundation => write!(f, "MediaFoundation (hardware)"),
+            DecoderType::FFmpegHardware => write!(f, "FFmpeg (hardware)"),
+            DecoderType::FFmpegSoftware => write!(f, "FFmpeg (software)"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DecoderStatus {
+    pub decoder_type: DecoderType,
+    pub video_width: u32,
+    pub video_height: u32,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecoderInitResult {
+    pub width: u32,
+    pub height: u32,
+    pub decoder_type: DecoderType,
+}
+
+#[cfg(target_os = "windows")]
+use windows::Win32::{Foundation::HANDLE, Graphics::Direct3D11::ID3D11Texture2D};
+
+#[cfg(target_os = "windows")]
+pub struct SendableD3D11Texture {
+    texture: ID3D11Texture2D,
+    shared_handle: Option<HANDLE>,
+    y_handle: Option<HANDLE>,
+    uv_handle: Option<HANDLE>,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for SendableD3D11Texture {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for SendableD3D11Texture {}
+
+#[cfg(target_os = "windows")]
+impl SendableD3D11Texture {
+    pub fn new(texture: ID3D11Texture2D) -> Self {
+        Self {
+            texture,
+            shared_handle: None,
+            y_handle: None,
+            uv_handle: None,
+        }
+    }
+
+    pub fn new_with_handle(texture: ID3D11Texture2D, shared_handle: Option<HANDLE>) -> Self {
+        Self {
+            texture,
+            shared_handle,
+            y_handle: None,
+            uv_handle: None,
+        }
+    }
+
+    pub fn new_with_yuv_handles(
+        texture: ID3D11Texture2D,
+        shared_handle: Option<HANDLE>,
+        y_handle: Option<HANDLE>,
+        uv_handle: Option<HANDLE>,
+    ) -> Self {
+        Self {
+            texture,
+            shared_handle,
+            y_handle,
+            uv_handle,
+        }
+    }
+
+    pub fn inner(&self) -> &ID3D11Texture2D {
+        &self.texture
+    }
+
+    pub fn shared_handle(&self) -> Option<HANDLE> {
+        self.shared_handle
+    }
+
+    pub fn y_handle(&self) -> Option<HANDLE> {
+        self.y_handle
+    }
+
+    pub fn uv_handle(&self) -> Option<HANDLE> {
+        self.uv_handle
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    Rgba,
+    Nv12,
+    Yuv420p,
+}
+
+#[derive(Clone)]
+pub struct DecodedFrame {
+    data: Arc<Vec<u8>>,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    y_stride: u32,
+    uv_stride: u32,
+    #[cfg(target_os = "macos")]
+    image_buf_backing: Option<Arc<SendableImageBuf>>,
+    #[cfg(target_os = "windows")]
+    d3d11_texture_backing: Option<Arc<SendableD3D11Texture>>,
+    #[cfg(target_os = "linux")]
+    cuda_nv12: Option<Arc<crate::linux_gpu::CudaNv12Frame>>,
+}
+
+#[cfg(target_os = "macos")]
+struct SendableImageBuf {
+    image_buf: Mutex<Option<R<cv::ImageBuf>>>,
+    raw_data: OnceLock<Vec<u8>>,
+}
+
+#[cfg(target_os = "macos")]
+// SAFETY: all CVPixelBuffer access is serialized by `image_buf`, and the Core
+// Foundation object remains retained for the lifetime of this wrapper.
+unsafe impl Send for SendableImageBuf {}
+#[cfg(target_os = "macos")]
+// SAFETY: see the `Send` implementation above.
+unsafe impl Sync for SendableImageBuf {}
+
+#[cfg(target_os = "macos")]
+impl SendableImageBuf {
+    fn new(image_buf: R<cv::ImageBuf>) -> Self {
+        Self {
+            image_buf: Mutex::new(Some(image_buf)),
+            raw_data: OnceLock::new(),
+        }
+    }
+
+    fn with_image_buf<T>(&self, f: impl FnOnce(&cv::ImageBuf) -> T) -> Option<T> {
+        let image_buf = self
+            .image_buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        image_buf.as_deref().map(f)
+    }
+
+    fn raw_data(&self) -> &[u8] {
+        self.raw_data.get_or_init(|| {
+            let mut image_buf_guard = self
+                .image_buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(image_buf) = image_buf_guard.as_mut() else {
+                return Vec::new();
+            };
+
+            unsafe {
+                image_buf
+                    .lock_base_addr(cv::pixel_buffer::LockFlags::READ_ONLY)
+                    .result()
+                    .unwrap();
+            }
+
+            let y_size = image_buf.plane_bytes_per_row(0) * image_buf.plane_height(0);
+            let uv_size = image_buf.plane_bytes_per_row(1) * image_buf.plane_height(1);
+            let y_plane =
+                unsafe { std::slice::from_raw_parts(image_buf.plane_base_address(0), y_size) };
+            let uv_plane =
+                unsafe { std::slice::from_raw_parts(image_buf.plane_base_address(1), uv_size) };
+
+            let mut data = Vec::with_capacity(y_size + uv_size);
+            data.extend_from_slice(y_plane);
+            data.extend_from_slice(uv_plane);
+
+            unsafe {
+                image_buf.unlock_lock_base_addr(cv::pixel_buffer::LockFlags::READ_ONLY);
+            }
+
+            // CPU consumers no longer need the IOSurface after its planes have
+            // been copied. Releasing it keeps cache accounting at one frame
+            // instead of retaining both the CVPixelBuffer and its materialized
+            // bytes for the lifetime of the cache entry.
+            *image_buf_guard = None;
+
+            data
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DecodedFrameStorageIdentity {
+    data: Weak<Vec<u8>>,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    y_stride: u32,
+    uv_stride: u32,
+}
+
+impl DecodedFrameStorageIdentity {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.data.ptr_eq(&other.data)
+            && self.width == other.width
+            && self.height == other.height
+            && self.format == other.format
+            && self.y_stride == other.y_stride
+            && self.uv_stride == other.uv_stride
+    }
+}
+
+impl fmt::Debug for DecodedFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodedFrame")
+            .field("data_len", &self.data.len())
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("format", &self.format)
+            .field("y_stride", &self.y_stride)
+            .field("uv_stride", &self.uv_stride)
+            .finish()
+    }
+}
+
+impl DecodedFrame {
+    pub fn new(data: Vec<u8>, width: u32, height: u32) -> Self {
+        Self {
+            data: Arc::new(data),
+            width,
+            height,
+            format: PixelFormat::Rgba,
+            y_stride: width * 4,
+            uv_stride: 0,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            #[cfg(target_os = "windows")]
+            d3d11_texture_backing: None,
+            #[cfg(target_os = "linux")]
+            cuda_nv12: None,
+        }
+    }
+
+    pub fn new_with_arc(data: Arc<Vec<u8>>, width: u32, height: u32) -> Self {
+        Self {
+            data,
+            width,
+            height,
+            format: PixelFormat::Rgba,
+            y_stride: width * 4,
+            uv_stride: 0,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            #[cfg(target_os = "windows")]
+            d3d11_texture_backing: None,
+            #[cfg(target_os = "linux")]
+            cuda_nv12: None,
+        }
+    }
+
+    /// NV12 frame that never left GPU memory (NVDEC on Linux render hosts).
+    /// `storage` is the decoder's per-frame allocation: layers compare it to
+    /// skip re-uploading a frame they already hold (VFR holds, fps upsampling).
+    #[cfg(target_os = "linux")]
+    pub fn new_nv12_cuda(
+        frame: Arc<crate::linux_gpu::CudaNv12Frame>,
+        storage: Arc<Vec<u8>>,
+    ) -> Self {
+        Self {
+            data: storage,
+            width: frame.width,
+            height: frame.height,
+            format: PixelFormat::Nv12,
+            y_stride: frame.y_pitch as u32,
+            uv_stride: frame.uv_pitch as u32,
+            cuda_nv12: Some(frame),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn cuda_nv12(&self) -> Option<&Arc<crate::linux_gpu::CudaNv12Frame>> {
+        self.cuda_nv12.as_ref()
+    }
+
+    pub fn new_nv12(data: Vec<u8>, width: u32, height: u32, y_stride: u32, uv_stride: u32) -> Self {
+        Self {
+            data: Arc::new(data),
+            width,
+            height,
+            format: PixelFormat::Nv12,
+            y_stride,
+            uv_stride,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            #[cfg(target_os = "windows")]
+            d3d11_texture_backing: None,
+            #[cfg(target_os = "linux")]
+            cuda_nv12: None,
+        }
+    }
+
+    pub fn new_nv12_with_arc(
+        data: Arc<Vec<u8>>,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        uv_stride: u32,
+    ) -> Self {
+        Self {
+            data,
+            width,
+            height,
+            format: PixelFormat::Nv12,
+            y_stride,
+            uv_stride,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            #[cfg(target_os = "windows")]
+            d3d11_texture_backing: None,
+            #[cfg(target_os = "linux")]
+            cuda_nv12: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn new_nv12_with_image_buf(
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        uv_stride: u32,
+        image_buf: R<cv::ImageBuf>,
+    ) -> Self {
+        Self {
+            data: Arc::new(Vec::new()),
+            width,
+            height,
+            format: PixelFormat::Nv12,
+            y_stride,
+            uv_stride,
+            image_buf_backing: Some(Arc::new(SendableImageBuf::new(image_buf))),
+        }
+    }
+
+    pub fn new_yuv420p(
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        uv_stride: u32,
+    ) -> Self {
+        Self {
+            data: Arc::new(data),
+            width,
+            height,
+            format: PixelFormat::Yuv420p,
+            y_stride,
+            uv_stride,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            #[cfg(target_os = "windows")]
+            d3d11_texture_backing: None,
+            #[cfg(target_os = "linux")]
+            cuda_nv12: None,
+        }
+    }
+
+    pub fn new_yuv420p_with_arc(
+        data: Arc<Vec<u8>>,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        uv_stride: u32,
+    ) -> Self {
+        Self {
+            data,
+            width,
+            height,
+            format: PixelFormat::Yuv420p,
+            y_stride,
+            uv_stride,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            #[cfg(target_os = "windows")]
+            d3d11_texture_backing: None,
+            #[cfg(target_os = "linux")]
+            cuda_nv12: None,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn new_nv12_with_d3d11_texture(width: u32, height: u32, texture: ID3D11Texture2D) -> Self {
+        Self {
+            data: Arc::new(Vec::new()),
+            width,
+            height,
+            format: PixelFormat::Nv12,
+            y_stride: width,
+            uv_stride: width,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            d3d11_texture_backing: Some(Arc::new(SendableD3D11Texture::new(texture))),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn new_nv12_with_d3d11_texture_and_handle(
+        width: u32,
+        height: u32,
+        texture: ID3D11Texture2D,
+        shared_handle: Option<HANDLE>,
+    ) -> Self {
+        Self {
+            data: Arc::new(Vec::new()),
+            width,
+            height,
+            format: PixelFormat::Nv12,
+            y_stride: width,
+            uv_stride: width,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            d3d11_texture_backing: Some(Arc::new(SendableD3D11Texture::new_with_handle(
+                texture,
+                shared_handle,
+            ))),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn new_nv12_with_d3d11_texture_and_yuv_handles(
+        width: u32,
+        height: u32,
+        texture: ID3D11Texture2D,
+        shared_handle: Option<HANDLE>,
+        y_handle: Option<HANDLE>,
+        uv_handle: Option<HANDLE>,
+    ) -> Self {
+        Self {
+            data: Arc::new(Vec::new()),
+            width,
+            height,
+            format: PixelFormat::Nv12,
+            y_stride: width,
+            uv_stride: width,
+            #[cfg(target_os = "macos")]
+            image_buf_backing: None,
+            d3d11_texture_backing: Some(Arc::new(SendableD3D11Texture::new_with_yuv_handles(
+                texture,
+                shared_handle,
+                y_handle,
+                uv_handle,
+            ))),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::redundant_closure)]
+    pub fn d3d11_texture_backing(&self) -> Option<&ID3D11Texture2D> {
+        self.d3d11_texture_backing.as_ref().map(|b| b.inner())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_shared_handle(&self) -> Option<HANDLE> {
+        self.d3d11_texture_backing
+            .as_ref()
+            .and_then(|b| b.shared_handle())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_y_handle(&self) -> Option<HANDLE> {
+        self.d3d11_texture_backing
+            .as_ref()
+            .and_then(|b| b.y_handle())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_uv_handle(&self) -> Option<HANDLE> {
+        self.d3d11_texture_backing
+            .as_ref()
+            .and_then(|b| b.uv_handle())
+    }
+
+    pub fn data(&self) -> &[u8] {
+        #[cfg(target_os = "macos")]
+        if self.data.is_empty()
+            && let Some(backing) = &self.image_buf_backing
+        {
+            return backing.raw_data();
+        }
+
+        &self.data
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_image_buf<T>(&self, f: impl FnOnce(&cv::ImageBuf) -> T) -> Option<T> {
+        self.image_buf_backing
+            .as_ref()
+            .and_then(|backing| backing.with_image_buf(f))
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn format(&self) -> PixelFormat {
+        self.format
+    }
+
+    pub fn byte_len(&self) -> usize {
+        if !self.data.is_empty() {
+            return self.data.len();
+        }
+
+        let y_bytes = (self.y_stride as usize).saturating_mul(self.height as usize);
+        let uv_bytes = (self.uv_stride as usize).saturating_mul((self.height / 2) as usize);
+
+        match self.format {
+            PixelFormat::Rgba => (self.width as usize)
+                .saturating_mul(self.height as usize)
+                .saturating_mul(4),
+            PixelFormat::Nv12 => y_bytes.saturating_add(uv_bytes),
+            PixelFormat::Yuv420p => y_bytes.saturating_add(uv_bytes.saturating_mul(2)),
+        }
+    }
+
+    pub(crate) fn storage_identity(&self) -> DecodedFrameStorageIdentity {
+        DecodedFrameStorageIdentity {
+            data: Arc::downgrade(&self.data),
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            y_stride: self.y_stride,
+            uv_stride: self.uv_stride,
+        }
+    }
+
+    pub fn y_plane(&self) -> Option<&[u8]> {
+        match self.format {
+            PixelFormat::Nv12 | PixelFormat::Yuv420p => {
+                let y_size = self
+                    .y_stride
+                    .checked_mul(self.height)
+                    .and_then(|v| usize::try_from(v).ok())?;
+                self.data().get(..y_size)
+            }
+            PixelFormat::Rgba => None,
+        }
+    }
+
+    pub fn uv_plane(&self) -> Option<&[u8]> {
+        match self.format {
+            PixelFormat::Nv12 => {
+                let y_size = self
+                    .y_stride
+                    .checked_mul(self.height)
+                    .and_then(|v| usize::try_from(v).ok())?;
+                self.data().get(y_size..)
+            }
+            PixelFormat::Yuv420p | PixelFormat::Rgba => None,
+        }
+    }
+
+    pub fn u_plane(&self) -> Option<&[u8]> {
+        match self.format {
+            PixelFormat::Yuv420p => {
+                let y_size = self
+                    .y_stride
+                    .checked_mul(self.height)
+                    .and_then(|v| usize::try_from(v).ok())?;
+                let u_size = self
+                    .uv_stride
+                    .checked_mul(self.height / 2)
+                    .and_then(|v| usize::try_from(v).ok())?;
+                let u_end = y_size.checked_add(u_size)?;
+                self.data().get(y_size..u_end)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn v_plane(&self) -> Option<&[u8]> {
+        match self.format {
+            PixelFormat::Yuv420p => {
+                let y_size = self
+                    .y_stride
+                    .checked_mul(self.height)
+                    .and_then(|v| usize::try_from(v).ok())?;
+                let u_size = self
+                    .uv_stride
+                    .checked_mul(self.height / 2)
+                    .and_then(|v| usize::try_from(v).ok())?;
+                let v_start = y_size.checked_add(u_size)?;
+                self.data().get(v_start..)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn y_stride(&self) -> u32 {
+        self.y_stride
+    }
+
+    pub fn uv_stride(&self) -> u32 {
+        self.uv_stride
+    }
+}
+
+pub enum VideoDecoderMessage {
+    GetFrame(f32, u32, tokio::sync::oneshot::Sender<DecodedFrame>),
+}
+
+pub fn pts_to_frame(pts: i64, time_base: Rational, fps: u32) -> u32 {
+    (fps as f64 * ((pts as f64 * time_base.numerator() as f64) / (time_base.denominator() as f64)))
+        .round() as u32
+}
+
+pub const FRAME_CACHE_SIZE: usize = 90;
+const DEFAULT_MAX_FALLBACK_DISTANCE: u32 = 90;
+
+/// Records a pts hole discovered from a decode-order vend jump (frames vend
+/// in pts order, so a jump means no samples exist in between). The map stays
+/// bounded by dropping the narrowest hole — wide static-screen holds matter
+/// most.
+pub(super) fn record_pts_hole(
+    holes: &mut std::collections::BTreeMap<u32, u32>,
+    start: u32,
+    end: u32,
+) {
+    const MAX_TRACKED_HOLES: usize = 64;
+    holes.insert(start, end);
+    if holes.len() > MAX_TRACKED_HOLES
+        && let Some(narrowest) = holes
+            .iter()
+            .min_by_key(|&(&s, &e)| e.saturating_sub(s))
+            .map(|(&s, _)| s)
+    {
+        holes.remove(&narrowest);
+    }
+}
+
+#[derive(Clone)]
+pub struct AsyncVideoDecoderHandle {
+    sender: mpsc::Sender<VideoDecoderMessage>,
+    offset: f64,
+    status: DecoderStatus,
+    max_fallback_distance: u32,
+    #[cfg(target_os = "macos")]
+    fallback: Option<Arc<MacOsDecoderFallback>>,
+}
+
+#[cfg(target_os = "macos")]
+struct MacOsDecoderFallback {
+    name: &'static str,
+    path: PathBuf,
+    fps: u32,
+    decoder: tokio::sync::OnceCell<Result<AsyncVideoDecoderHandle, String>>,
+}
+
+impl AsyncVideoDecoderHandle {
+    const INITIAL_SEEK_TIMEOUT_MS: u64 = 10000;
+    const INITIAL_MAX_FALLBACK_DISTANCE: u32 = 2;
+
+    fn normal_timeout_ms(&self) -> u64 {
+        let pixels = (self.status.video_width as u64) * (self.status.video_height as u64);
+        if pixels > 4_000_000 {
+            4000
+        } else if pixels > 2_000_000 {
+            3000
+        } else {
+            2000
+        }
+    }
+
+    pub async fn get_frame(&self, time: f32) -> Option<DecodedFrame> {
+        self.get_frame_with_timeout(time, self.normal_timeout_ms(), self.max_fallback_distance)
+            .await
+    }
+
+    pub async fn get_frame_initial(&self, time: f32) -> Option<DecodedFrame> {
+        self.get_frame_with_timeout(
+            time,
+            Self::INITIAL_SEEK_TIMEOUT_MS,
+            self.max_fallback_distance
+                .min(Self::INITIAL_MAX_FALLBACK_DISTANCE),
+        )
+        .await
+    }
+
+    async fn get_frame_with_timeout(
+        &self,
+        time: f32,
+        timeout_ms: u64,
+        max_fallback_distance: u32,
+    ) -> Option<DecodedFrame> {
+        #[cfg(target_os = "macos")]
+        if let Some(fallback) = &self.fallback {
+            if let Some(result) = fallback.decoder.get() {
+                return match result {
+                    Ok(decoder) => {
+                        decoder
+                            .request_frame(time, timeout_ms, max_fallback_distance)
+                            .await
+                    }
+                    Err(_) => None,
+                };
+            }
+            if let Some(frame) = self
+                .request_frame(time, timeout_ms, max_fallback_distance)
+                .await
+            {
+                return Some(frame);
+            }
+            let result = fallback
+                .decoder
+                .get_or_init(|| async {
+                    tracing::warn!(
+                        name = fallback.name,
+                        "Video reader stopped returning frames; switching to software decoding"
+                    );
+                    let mut decoder = spawn_ffmpeg_decoder(
+                        fallback.name,
+                        fallback.path.clone(),
+                        fallback.fps,
+                        self.offset,
+                        Duration::from_secs(30),
+                        false,
+                    )
+                    .await?;
+                    decoder.status.fallback_reason =
+                        Some("AVAssetReader returned no frame".to_string());
+                    Ok(decoder)
+                })
+                .await;
+            return match result {
+                Ok(decoder) => {
+                    decoder
+                        .request_frame(time, timeout_ms, max_fallback_distance)
+                        .await
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Software video decoder fallback failed");
+                    None
+                }
+            };
+        }
+        self.request_frame(time, timeout_ms, max_fallback_distance)
+            .await
+    }
+
+    async fn request_frame(
+        &self,
+        time: f32,
+        timeout_ms: u64,
+        max_fallback_distance: u32,
+    ) -> Option<DecodedFrame> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let adjusted_time = self.get_time(time);
+
+        if self
+            .sender
+            .send(VideoDecoderMessage::GetFrame(
+                adjusted_time,
+                max_fallback_distance,
+                tx,
+            ))
+            .is_err()
+        {
+            tracing::warn!(
+                time = adjusted_time,
+                "decoder thread is gone; frame request dropped"
+            );
+            return None;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
+            Ok(result) => result.ok(),
+            Err(_) => {
+                tracing::warn!(
+                    time = adjusted_time,
+                    timeout_ms = timeout_ms,
+                    "Frame decode request timed out"
+                );
+                None
+            }
+        }
+    }
+
+    pub fn get_time(&self, time: f32) -> f32 {
+        time + self.offset as f32
+    }
+
+    pub fn decoder_status(&self) -> &DecoderStatus {
+        #[cfg(target_os = "macos")]
+        if let Some(Ok(decoder)) = self
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.decoder.get())
+        {
+            return &decoder.status;
+        }
+        &self.status
+    }
+
+    pub fn decoder_type(&self) -> DecoderType {
+        self.decoder_status().decoder_type
+    }
+
+    pub fn is_hardware_accelerated(&self) -> bool {
+        self.decoder_type().is_hardware_accelerated()
+    }
+
+    pub fn video_dimensions(&self) -> (u32, u32) {
+        (self.status.video_width, self.status.video_height)
+    }
+
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.decoder_status().fallback_reason.as_deref()
+    }
+
+    pub fn with_max_fallback_distance(mut self, max_fallback_distance: u32) -> Self {
+        self.max_fallback_distance = max_fallback_distance;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ManagedVideoError {
+    #[error("Managed video initialization failed: {0}")]
+    Initialization(String),
+    #[error("Managed video decode failed: {0}")]
+    Decode(String),
+    #[error("Managed video seek failed: {0}")]
+    Seek(String),
+    #[error("Managed video contains no decodable frames")]
+    NoFrames,
+    #[error("Managed video was cancelled")]
+    Cancelled,
+    #[error("Managed video worker panicked")]
+    WorkerPanicked,
+    #[error("Managed video worker exited")]
+    WorkerExited,
+    #[error("Managed video is not initialized")]
+    NotReady,
+    #[error("Managed video initialization timed out")]
+    InitializationTimeout,
+    #[error("Managed video frame request timed out")]
+    FrameTimeout,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedVideoExit {
+    pub terminal: ManagedVideoError,
+}
+
+#[derive(Clone, Default)]
+struct ManagedVideoState {
+    terminal: Option<ManagedVideoError>,
+    exit: Option<ManagedVideoExit>,
+}
+
+struct ManagedVideoControl {
+    cancelled: std::sync::atomic::AtomicBool,
+    state: tokio::sync::watch::Sender<ManagedVideoState>,
+    join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl ManagedVideoControl {
+    fn new() -> Arc<Self> {
+        let (state, _) = tokio::sync::watch::channel(ManagedVideoState::default());
+        Arc::new(Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            state,
+            join: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn terminal(&self) -> Option<ManagedVideoError> {
+        self.state.borrow().terminal.clone()
+    }
+
+    fn fail(&self, error: ManagedVideoError) -> ManagedVideoError {
+        self.state.send_if_modified(|state| {
+            if state.terminal.is_some() {
+                false
+            } else {
+                state.terminal = Some(error.clone());
+                true
+            }
+        });
+        self.terminal().unwrap_or(error)
+    }
+
+    fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.fail(ManagedVideoError::Cancelled);
+    }
+
+    fn run_worker(&self, work: impl FnOnce()) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        self.finished_after_drop(result.is_err());
+    }
+
+    fn finished_after_drop(&self, panicked: bool) {
+        self.fail(if panicked {
+            ManagedVideoError::WorkerPanicked
+        } else if self.is_cancelled() {
+            ManagedVideoError::Cancelled
+        } else {
+            ManagedVideoError::WorkerExited
+        });
+    }
+
+    fn joined(&self, panicked: bool) {
+        self.finished_after_drop(panicked);
+        self.state.send_modify(|state| {
+            state.exit = Some(ManagedVideoExit {
+                terminal: state
+                    .terminal
+                    .clone()
+                    .unwrap_or(ManagedVideoError::WorkerExited),
+            });
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct ManagedVideoStopHandle {
+    control: Arc<ManagedVideoControl>,
+    wake: mpsc::Sender<VideoDecoderMessage>,
+}
+
+impl ManagedVideoStopHandle {
+    pub fn cancel(&self) {
+        self.control.cancel();
+        let (reply, receiver) = oneshot::channel();
+        drop(receiver);
+        let _ = self.wake.send(VideoDecoderMessage::GetFrame(0.0, 0, reply));
+    }
+
+    pub fn terminal_error(&self) -> Option<ManagedVideoError> {
+        self.control.terminal()
+    }
+
+    pub async fn wait_for_terminal(&self) -> ManagedVideoError {
+        let mut state = self.control.state.subscribe();
+        loop {
+            if let Some(error) = state.borrow_and_update().terminal.clone() {
+                return error;
+            }
+            state
+                .changed()
+                .await
+                .expect("Managed worker owner retains its status sender");
+        }
+    }
+
+    pub async fn stop_and_wait(&self) -> ManagedVideoExit {
+        self.cancel();
+        let join = self
+            .control
+            .join
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(join) = join {
+            let control = self.control.clone();
+            drop(tokio::task::spawn_blocking(move || {
+                let panicked = join.join().is_err();
+                control.joined(panicked);
+            }));
+        }
+        let mut state = self.control.state.subscribe();
+        loop {
+            if let Some(exit) = state.borrow_and_update().exit.clone() {
+                return exit;
+            }
+            state
+                .changed()
+                .await
+                .expect("Managed worker owner retains its status sender");
+        }
+    }
+}
+
+struct CancelManagedReadiness(Option<ManagedVideoStopHandle>);
+
+impl Drop for CancelManagedReadiness {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            worker.cancel();
+        }
+    }
+}
+
+struct ManagedVideoInput {
+    source: cap_enc_ffmpeg::RelocatableSource,
+    paths: Vec<PathBuf>,
+}
+
+pub struct ManagedVideoDecoder {
+    worker: ManagedVideoStopHandle,
+    ready: Option<oneshot::Receiver<Result<DecoderInitResult, String>>>,
+    decoder: Option<AsyncVideoDecoderHandle>,
+    offset: f64,
+    max_fallback_distance: u32,
+}
+
+impl ManagedVideoDecoder {
+    pub fn with_max_fallback_distance(mut self, max_fallback_distance: u32) -> Self {
+        self.max_fallback_distance = max_fallback_distance.min(DEFAULT_MAX_FALLBACK_DISTANCE);
+        if let Some(decoder) = self.decoder.as_mut() {
+            decoder.max_fallback_distance = self.max_fallback_distance;
+        }
+        self
+    }
+
+    pub fn stop_handle(&self) -> ManagedVideoStopHandle {
+        self.worker.clone()
+    }
+
+    pub fn terminal_error(&self) -> Option<ManagedVideoError> {
+        self.worker.terminal_error()
+    }
+
+    pub async fn wait_ready(&mut self) -> Result<DecoderStatus, ManagedVideoError> {
+        if let Some(error) = self.terminal_error() {
+            self.stop_and_wait().await;
+            return Err(error);
+        }
+        if let Some(decoder) = &self.decoder {
+            return Ok(decoder.status.clone());
+        }
+        let ready = self.ready.as_mut().ok_or(ManagedVideoError::NotReady)?;
+        let mut cancellation = CancelManagedReadiness(Some(self.worker.clone()));
+        let result = tokio::time::timeout(Duration::from_secs(30), ready).await;
+        cancellation.0 = None;
+        let _ = self.ready.take();
+        let initialized = match result {
+            Ok(Ok(Ok(initialized))) => initialized,
+            result => {
+                let error = match result {
+                    Ok(Ok(Err(error))) => ManagedVideoError::Initialization(error),
+                    Ok(Err(_)) => ManagedVideoError::WorkerExited,
+                    Err(_) => ManagedVideoError::InitializationTimeout,
+                    Ok(Ok(Ok(_))) => unreachable!(),
+                };
+                let error = self.worker.control.fail(error);
+                self.stop_and_wait().await;
+                return Err(error);
+            }
+        };
+        if let Some(error) = self.terminal_error() {
+            self.stop_and_wait().await;
+            return Err(error);
+        }
+        let status = DecoderStatus {
+            decoder_type: initialized.decoder_type,
+            video_width: initialized.width,
+            video_height: initialized.height,
+            fallback_reason: None,
+        };
+        self.decoder = Some(AsyncVideoDecoderHandle {
+            sender: self.worker.wake.clone(),
+            offset: self.offset,
+            status: status.clone(),
+            max_fallback_distance: self.max_fallback_distance,
+            #[cfg(target_os = "macos")]
+            fallback: None,
+        });
+        Ok(status)
+    }
+
+    pub fn decoder_status(&self) -> Option<&DecoderStatus> {
+        self.decoder
+            .as_ref()
+            .map(AsyncVideoDecoderHandle::decoder_status)
+    }
+
+    pub async fn get_frame(&self, time: f32) -> Result<DecodedFrame, ManagedVideoError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        let decoder = self.decoder.as_ref().ok_or(ManagedVideoError::NotReady)?;
+        self.get_frame_with_timeout(
+            time,
+            decoder.normal_timeout_ms(),
+            decoder.max_fallback_distance,
+        )
+        .await
+    }
+
+    pub async fn get_frame_initial(&self, time: f32) -> Result<DecodedFrame, ManagedVideoError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        let decoder = self.decoder.as_ref().ok_or(ManagedVideoError::NotReady)?;
+        self.get_frame_with_timeout(
+            time,
+            AsyncVideoDecoderHandle::INITIAL_SEEK_TIMEOUT_MS,
+            decoder
+                .max_fallback_distance
+                .min(AsyncVideoDecoderHandle::INITIAL_MAX_FALLBACK_DISTANCE),
+        )
+        .await
+    }
+
+    async fn get_frame_with_timeout(
+        &self,
+        time: f32,
+        timeout_ms: u64,
+        max_fallback_distance: u32,
+    ) -> Result<DecodedFrame, ManagedVideoError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        let decoder = self.decoder.as_ref().ok_or(ManagedVideoError::NotReady)?;
+        let (reply, mut receiver) = oneshot::channel();
+        let mut state = self.worker.control.state.subscribe();
+        if decoder
+            .sender
+            .send(VideoDecoderMessage::GetFrame(
+                decoder.get_time(time),
+                max_fallback_distance,
+                reply,
+            ))
+            .is_err()
+        {
+            let error = self.worker.control.fail(ManagedVideoError::WorkerExited);
+            self.stop_and_wait().await;
+            return Err(error);
+        }
+        let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
+        tokio::pin!(timeout);
+        loop {
+            if let Some(error) = self.terminal_error() {
+                return Err(error);
+            }
+            tokio::select! {
+                result = &mut receiver => {
+                    if let Some(error) = self.terminal_error() {
+                        return Err(error);
+                    }
+                    match result {
+                        Ok(frame) => return Ok(frame),
+                        Err(_) => {
+                            let error = self.worker.control.fail(ManagedVideoError::WorkerExited);
+                            self.stop_and_wait().await;
+                            return Err(error);
+                        }
+                    }
+                }
+                _ = &mut timeout => {
+                    let error = self.worker.control.fail(ManagedVideoError::FrameTimeout);
+                    self.stop_and_wait().await;
+                    return Err(error);
+                }
+                changed = state.changed() => {
+                    changed.expect("Managed worker owner retains its status sender");
+                }
+            }
+        }
+    }
+
+    pub async fn stop_and_wait(&self) -> ManagedVideoExit {
+        self.worker.stop_and_wait().await
+    }
+}
+
+impl Drop for ManagedVideoDecoder {
+    fn drop(&mut self) {
+        self.worker.cancel();
+    }
+}
+
+pub fn spawn_managed_decoder<'a>(
+    name: &'static str,
+    source: cap_enc_ffmpeg::RelocatableSource,
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
+    fps: u32,
+    offset: f64,
+    use_hw_acceleration: bool,
+) -> Result<ManagedVideoDecoder, ManagedVideoError> {
+    let input = ManagedVideoInput {
+        source,
+        paths: paths
+            .into_iter()
+            .map(std::path::Path::to_path_buf)
+            .collect(),
+    };
+    let control = ManagedVideoControl::new();
+    let (sender, receiver) = mpsc::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let worker = ManagedVideoStopHandle {
+        control: control.clone(),
+        wake: sender,
+    };
+    let join = ffmpeg::FfmpegDecoder::spawn_managed(
+        name,
+        input,
+        fps,
+        receiver,
+        ready_tx,
+        use_hw_acceleration,
+        control.clone(),
+    )
+    .map_err(ManagedVideoError::Initialization)?;
+    *control
+        .join
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(join);
+    Ok(ManagedVideoDecoder {
+        worker,
+        ready: Some(ready_rx),
+        decoder: None,
+        offset,
+        max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn spawn_ffmpeg_decoder(
+    name: &'static str,
+    path: PathBuf,
+    fps: u32,
+    offset: f64,
+    timeout_duration: Duration,
+    use_hw_acceleration: bool,
+) -> Result<AsyncVideoDecoderHandle, String> {
+    let path_display = path.display().to_string();
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<DecoderInitResult, String>>();
+    let (tx, rx) = mpsc::channel();
+
+    ffmpeg::FfmpegDecoder::spawn_with_hw_config(name, path, fps, rx, ready_tx, use_hw_acceleration)
+        .map_err(|e| format!("'{name}' FFmpeg decoder / {e}"))?;
+
+    match tokio::time::timeout(timeout_duration, ready_rx).await {
+        Ok(Ok(Ok(init_result))) => {
+            info!(
+                "Video '{}' using {} decoder ({}x{})",
+                name, init_result.decoder_type, init_result.width, init_result.height
+            );
+            let status = DecoderStatus {
+                decoder_type: init_result.decoder_type,
+                video_width: init_result.width,
+                video_height: init_result.height,
+                fallback_reason: None,
+            };
+            Ok(AsyncVideoDecoderHandle {
+                sender: tx,
+                offset,
+                status,
+                max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+                #[cfg(target_os = "macos")]
+                fallback: None,
+            })
+        }
+        Ok(Ok(Err(e))) => Err(format!(
+            "'{name}' FFmpeg decoder initialization failed: {e}"
+        )),
+        Ok(Err(e)) => Err(format!("'{name}' FFmpeg decoder channel closed: {e}")),
+        Err(_) => Err(format!(
+            "'{name}' FFmpeg decoder timed out after 30s initializing: {path_display}"
+        )),
+    }
+}
+
+pub async fn spawn_decoder(
+    name: &'static str,
+    path: PathBuf,
+    fps: u32,
+    offset: f64,
+    force_ffmpeg: bool,
+) -> Result<AsyncVideoDecoderHandle, String> {
+    let path_display = path.display().to_string();
+    let timeout_duration = Duration::from_secs(30);
+
+    #[cfg(target_os = "macos")]
+    {
+        if force_ffmpeg || path.is_dir() {
+            info!(
+                force_ffmpeg,
+                segmented = path.is_dir(),
+                "Video '{}' using FFmpeg decoder",
+                name
+            );
+            return spawn_ffmpeg_decoder(name, path, fps, offset, timeout_duration, true).await;
+        }
+
+        let avasset_result = {
+            let (ready_tx, ready_rx) = oneshot::channel::<Result<DecoderInitResult, String>>();
+            let (tx, rx) = mpsc::channel();
+
+            avassetreader::AVAssetReaderDecoder::spawn(name, path.clone(), fps, rx, ready_tx);
+
+            match tokio::time::timeout(timeout_duration, ready_rx).await {
+                Ok(Ok(Ok(init_result))) => {
+                    info!(
+                        "Video '{}' using {} decoder ({}x{})",
+                        name, init_result.decoder_type, init_result.width, init_result.height
+                    );
+                    let status = DecoderStatus {
+                        decoder_type: init_result.decoder_type,
+                        video_width: init_result.width,
+                        video_height: init_result.height,
+                        fallback_reason: None,
+                    };
+                    Ok(AsyncVideoDecoderHandle {
+                        sender: tx,
+                        offset,
+                        status,
+                        max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+                        #[cfg(target_os = "macos")]
+                        fallback: Some(Arc::new(MacOsDecoderFallback {
+                            name,
+                            path: path.clone(),
+                            fps,
+                            decoder: tokio::sync::OnceCell::new(),
+                        })),
+                    })
+                }
+                Ok(Ok(Err(e))) => Err(format!("AVAssetReader initialization failed: {e}")),
+                Ok(Err(e)) => Err(format!("AVAssetReader channel closed: {e}")),
+                Err(_) => Err(format!(
+                    "AVAssetReader timed out after 30s initializing: {path_display}"
+                )),
+            }
+        };
+
+        match avasset_result {
+            Ok(handle) => Ok(handle),
+            Err(avasset_error) => {
+                tracing::warn!(
+                    name = name,
+                    error = %avasset_error,
+                    "AVAssetReader failed, falling back to FFmpeg decoder"
+                );
+
+                let (ready_tx, ready_rx) = oneshot::channel::<Result<DecoderInitResult, String>>();
+                let (tx, rx) = mpsc::channel();
+
+                if let Err(e) = ffmpeg::FfmpegDecoder::spawn(name, path, fps, rx, ready_tx) {
+                    return Err(format!(
+                        "'{name}' decoder failed - AVAssetReader: {avasset_error}, FFmpeg: {e}"
+                    ));
+                }
+
+                match tokio::time::timeout(timeout_duration, ready_rx).await {
+                    Ok(Ok(Ok(init_result))) => {
+                        info!(
+                            "Video '{}' using {} decoder ({}x{}) after AVAssetReader failure",
+                            name, init_result.decoder_type, init_result.width, init_result.height
+                        );
+                        let status = DecoderStatus {
+                            decoder_type: init_result.decoder_type,
+                            video_width: init_result.width,
+                            video_height: init_result.height,
+                            fallback_reason: Some(avasset_error),
+                        };
+                        Ok(AsyncVideoDecoderHandle {
+                            sender: tx,
+                            offset,
+                            status,
+                            max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+                            #[cfg(target_os = "macos")]
+                            fallback: None,
+                        })
+                    }
+                    Ok(Ok(Err(e))) => Err(format!(
+                        "'{name}' decoder failed - AVAssetReader: {avasset_error}, FFmpeg: {e}"
+                    )),
+                    Ok(Err(e)) => Err(format!(
+                        "'{name}' decoder failed - AVAssetReader: {avasset_error}, FFmpeg channel: {e}"
+                    )),
+                    Err(_) => Err(format!(
+                        "'{name}' decoder failed - AVAssetReader: {avasset_error}, FFmpeg timed out"
+                    )),
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if force_ffmpeg {
+            info!("Video '{}' using FFmpeg software decoder (forced)", name);
+            let (ready_tx, ready_rx) = oneshot::channel::<Result<DecoderInitResult, String>>();
+            let (tx, rx) = mpsc::channel();
+
+            ffmpeg::FfmpegDecoder::spawn_with_hw_config(name, path, fps, rx, ready_tx, false)
+                .map_err(|e| format!("'{name}' FFmpeg decoder / {e}"))?;
+
+            return match tokio::time::timeout(timeout_duration, ready_rx).await {
+                Ok(Ok(Ok(init_result))) => {
+                    info!(
+                        "Video '{}' using {} decoder ({}x{})",
+                        name, init_result.decoder_type, init_result.width, init_result.height
+                    );
+                    let status = DecoderStatus {
+                        decoder_type: init_result.decoder_type,
+                        video_width: init_result.width,
+                        video_height: init_result.height,
+                        fallback_reason: None,
+                    };
+                    Ok(AsyncVideoDecoderHandle {
+                        sender: tx,
+                        offset,
+                        status,
+                        max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+                        #[cfg(target_os = "macos")]
+                        fallback: None,
+                    })
+                }
+                Ok(Ok(Err(e))) => Err(format!(
+                    "'{name}' FFmpeg decoder initialization failed: {e}"
+                )),
+                Ok(Err(e)) => Err(format!("'{name}' FFmpeg decoder channel closed: {e}")),
+                Err(_) => Err(format!(
+                    "'{name}' FFmpeg decoder timed out after 30s initializing: {path_display}"
+                )),
+            };
+        }
+
+        let mf_result = {
+            let (ready_tx, ready_rx) = oneshot::channel::<Result<DecoderInitResult, String>>();
+            let (tx, rx) = mpsc::channel();
+
+            match media_foundation::MFDecoder::spawn(name, path.clone(), fps, rx, ready_tx) {
+                Ok(()) => match tokio::time::timeout(timeout_duration, ready_rx).await {
+                    Ok(Ok(Ok(init_result))) => {
+                        info!(
+                            "Video '{}' using {} decoder ({}x{})",
+                            name, init_result.decoder_type, init_result.width, init_result.height
+                        );
+                        let status = DecoderStatus {
+                            decoder_type: init_result.decoder_type,
+                            video_width: init_result.width,
+                            video_height: init_result.height,
+                            fallback_reason: None,
+                        };
+                        Ok(AsyncVideoDecoderHandle {
+                            sender: tx,
+                            offset,
+                            status,
+                            max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+                            #[cfg(target_os = "macos")]
+                            fallback: None,
+                        })
+                    }
+                    Ok(Ok(Err(e))) => Err(format!(
+                        "'{name}' MediaFoundation initialization failed: {e} ({path_display})"
+                    )),
+                    Ok(Err(e)) => Err(format!(
+                        "'{name}' MediaFoundation channel closed: {e} ({path_display})"
+                    )),
+                    Err(_) => Err(format!(
+                        "'{name}' MediaFoundation timed out after 30s initializing: {path_display}"
+                    )),
+                },
+                Err(e) => Err(format!(
+                    "'{name}' MediaFoundation spawn failed: {e} ({path_display})"
+                )),
+            }
+        };
+
+        match mf_result {
+            Ok(handle) => Ok(handle),
+            Err(mf_error) => {
+                tracing::warn!(
+                    name = name,
+                    error = %mf_error,
+                    "MediaFoundation failed, falling back to FFmpeg decoder"
+                );
+
+                let (ready_tx, ready_rx) = oneshot::channel::<Result<DecoderInitResult, String>>();
+                let (tx, rx) = mpsc::channel();
+
+                if let Err(e) = ffmpeg::FfmpegDecoder::spawn(name, path, fps, rx, ready_tx) {
+                    return Err(format!(
+                        "'{name}' decoder failed - MediaFoundation: {mf_error}, FFmpeg: {e}"
+                    ));
+                }
+
+                match tokio::time::timeout(timeout_duration, ready_rx).await {
+                    Ok(Ok(Ok(init_result))) => {
+                        info!(
+                            "Video '{}' using {} decoder ({}x{}) after MediaFoundation failure",
+                            name, init_result.decoder_type, init_result.width, init_result.height
+                        );
+                        let status = DecoderStatus {
+                            decoder_type: init_result.decoder_type,
+                            video_width: init_result.width,
+                            video_height: init_result.height,
+                            fallback_reason: Some(mf_error),
+                        };
+                        Ok(AsyncVideoDecoderHandle {
+                            sender: tx,
+                            offset,
+                            status,
+                            max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+                            #[cfg(target_os = "macos")]
+                            fallback: None,
+                        })
+                    }
+                    Ok(Ok(Err(e))) => Err(format!(
+                        "'{name}' decoder failed - MediaFoundation: {mf_error}, FFmpeg: {e}"
+                    )),
+                    Ok(Err(e)) => Err(format!(
+                        "'{name}' decoder failed - MediaFoundation: {mf_error}, FFmpeg channel: {e}"
+                    )),
+                    Err(_) => Err(format!(
+                        "'{name}' decoder failed - MediaFoundation: {mf_error}, FFmpeg timed out"
+                    )),
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = force_ffmpeg;
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<DecoderInitResult, String>>();
+        let (tx, rx) = mpsc::channel();
+
+        ffmpeg::FfmpegDecoder::spawn(name, path, fps, rx, ready_tx)
+            .map_err(|e| format!("'{name}' decoder / {e}"))?;
+
+        match tokio::time::timeout(timeout_duration, ready_rx).await {
+            Ok(Ok(Ok(init_result))) => {
+                info!(
+                    "Video '{}' using {} decoder ({}x{})",
+                    name, init_result.decoder_type, init_result.width, init_result.height
+                );
+                let status = DecoderStatus {
+                    decoder_type: init_result.decoder_type,
+                    video_width: init_result.width,
+                    video_height: init_result.height,
+                    fallback_reason: None,
+                };
+                Ok(AsyncVideoDecoderHandle {
+                    sender: tx,
+                    offset,
+                    status,
+                    max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+                    #[cfg(target_os = "macos")]
+                    fallback: None,
+                })
+            }
+            Ok(Ok(Err(e))) => Err(format!("'{name}' decoder initialization failed: {e}")),
+            Ok(Err(e)) => Err(format!("'{name}' decoder channel closed: {e}")),
+            Err(_) => Err(format!(
+                "'{name}' decoder timed out after 30s initializing: {path_display}"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_frame_storage_identity_matches_clones() {
+        let frame = DecodedFrame::new_nv12(vec![0; 6], 2, 2, 2, 2);
+        let cloned = frame.clone();
+
+        assert!(frame.storage_identity().matches(&cloned.storage_identity()));
+    }
+
+    #[test]
+    fn decoded_frame_storage_identity_rejects_distinct_or_reinterpreted_frames() {
+        let data = Arc::new(vec![0; 16]);
+        let original = DecodedFrame::new_with_arc(Arc::clone(&data), 2, 2);
+        let reinterpreted = DecodedFrame::new_with_arc(Arc::clone(&data), 1, 4);
+        let distinct = DecodedFrame::new(vec![0; 16], 2, 2);
+
+        assert!(
+            !original
+                .storage_identity()
+                .matches(&reinterpreted.storage_identity())
+        );
+        assert!(
+            !original
+                .storage_identity()
+                .matches(&distinct.storage_identity())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iosurface_backed_nv12_materializes_raw_planes_only_on_demand() {
+        let mut image_buf = cv::ImageBuf::new(4, 2, cv::PixelFormat::_420V, None).unwrap();
+
+        unsafe {
+            image_buf
+                .lock_base_addr(cv::pixel_buffer::LockFlags::DEFAULT)
+                .result()
+                .unwrap();
+        }
+
+        let y_stride = image_buf.plane_bytes_per_row(0);
+        let uv_stride = image_buf.plane_bytes_per_row(1);
+        let y_size = y_stride * image_buf.plane_height(0);
+        let uv_size = uv_stride * image_buf.plane_height(1);
+        unsafe {
+            std::ptr::write_bytes(image_buf.plane_base_address(0).cast_mut(), 0x11, y_size);
+            std::ptr::write_bytes(image_buf.plane_base_address(1).cast_mut(), 0x22, uv_size);
+            image_buf.unlock_lock_base_addr(cv::pixel_buffer::LockFlags::DEFAULT);
+        }
+
+        let frame = DecodedFrame::new_nv12_with_image_buf(
+            4,
+            2,
+            y_stride as u32,
+            uv_stride as u32,
+            image_buf,
+        );
+
+        assert_eq!(frame.byte_len(), y_size + uv_size);
+        assert!(frame.with_image_buf(|_| ()).is_some());
+        assert_eq!(frame.y_plane().unwrap(), vec![0x11; y_size]);
+        assert_eq!(frame.uv_plane().unwrap(), vec![0x22; uv_size]);
+        assert_eq!(frame.data().len(), y_size + uv_size);
+        assert!(frame.with_image_buf(|_| ()).is_none());
+    }
+
+    #[test]
+    fn pts_to_frame_maps_real_presentation_time_to_index() {
+        let tb = Rational::new(1, 600);
+        assert_eq!(pts_to_frame(0, tb, 30), 0);
+        assert_eq!(pts_to_frame(300, tb, 30), 15); // 0.5s
+        assert_eq!(pts_to_frame(600, tb, 30), 30); // 1.0s
+    }
+
+    // The frame index is `round(fps * real_pts_seconds)` — a function of the
+    // frame's real presentation time, independent of the stream time_base and of
+    // the frame's ordinal position. This is why selection on the nominal-fps grid
+    // does not accumulate A/V drift: a request for output time T (`floor(T*fps)`)
+    // resolves to the source frame whose real PTS is nearest T.
+    #[test]
+    fn pts_to_frame_is_anchored_to_time_not_timebase() {
+        // Same real time (1.0s) in two different time bases -> same index...
+        assert_eq!(
+            pts_to_frame(600, Rational::new(1, 600), 30),
+            pts_to_frame(1000, Rational::new(1, 1000), 30),
+        );
+        // ...and that index is the real one (round(30 * 1.0)), not a constant.
+        assert_eq!(pts_to_frame(600, Rational::new(1, 600), 30), 30);
+        assert_ne!(
+            pts_to_frame(600, Rational::new(1, 600), 30),
+            pts_to_frame(900, Rational::new(1, 600), 30),
+        );
+    }
+
+    // A source whose real rate (26.44fps) differs from the nominal grid (30fps):
+    // each source frame's index tracks its real time, so frames are held/dropped
+    // to the grid (a cadence artifact) but never drift out of time alignment.
+    #[test]
+    fn pts_to_frame_follows_real_time_for_off_nominal_source() {
+        let real_fps = 26.44_f64;
+        let tb = Rational::new(1, 1_000_000); // microseconds
+        let mut prev = 0u32;
+        for ordinal in 0..200u32 {
+            let t = ordinal as f64 / real_fps;
+            let pts = (t * 1_000_000.0).round() as i64;
+            let idx = pts_to_frame(pts, tb, 30);
+            assert_eq!(idx, (30.0 * t).round() as u32, "ordinal {ordinal}");
+            assert!(idx >= prev, "index must be monotonic non-decreasing");
+            prev = idx;
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_worker_tests {
+    mod segment_terminal_tests {
+        use super::*;
+        use crate::{
+            ManagedRecordingSegmentDecoders, ManagedSegmentVideoError, ManagedSegmentVideoExit,
+        };
+
+        enum TerminalWorkerCommand {
+            ReplyFrame,
+            Fail(ManagedVideoError),
+            Finish,
+        }
+
+        struct TerminalWorkerDriver {
+            worker: ManagedVideoStopHandle,
+            commands: mpsc::Sender<TerminalWorkerCommand>,
+            release: mpsc::Sender<()>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl TerminalWorkerDriver {
+            fn reply_frame(&self) {
+                self.commands
+                    .send(TerminalWorkerCommand::ReplyFrame)
+                    .unwrap();
+            }
+
+            fn fail(&self, error: ManagedVideoError) {
+                self.commands
+                    .send(TerminalWorkerCommand::Fail(error))
+                    .unwrap();
+            }
+
+            fn release(&self) {
+                self.commands.send(TerminalWorkerCommand::Finish).unwrap();
+                self.release.send(()).unwrap();
+            }
+
+            fn assert_healthy(&self) {
+                assert!(!self.worker.control.is_cancelled());
+                assert_eq!(self.worker.terminal_error(), None);
+                assert!(!self.dropped.load(Ordering::Acquire));
+                assert!(self.worker.control.state.borrow().exit.is_none());
+            }
+        }
+
+        impl Drop for TerminalWorkerDriver {
+            fn drop(&mut self) {
+                self.worker.cancel();
+                let _ = self.commands.send(TerminalWorkerCommand::Finish);
+                let _ = self.release.send(());
+            }
+        }
+
+        fn terminal_worker() -> (ManagedVideoDecoder, TerminalWorkerDriver) {
+            let control = ManagedVideoControl::new();
+            let (wake, requests) = mpsc::channel();
+            let (commands, requested_commands) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let (ready_sender, ready_receiver) = oneshot::channel();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let worker_control = control.clone();
+            let worker_dropped = dropped.clone();
+            let join = std::thread::spawn(move || {
+                worker_control.run_worker(|| {
+                    let _resource = DropSignal(worker_dropped);
+                    let _ = ready_sender.send(Ok(DecoderInitResult {
+                        width: 2,
+                        height: 2,
+                        decoder_type: DecoderType::FFmpegSoftware,
+                    }));
+                    while let Ok(command) = requested_commands.recv() {
+                        match command {
+                            TerminalWorkerCommand::ReplyFrame => {
+                                if let Ok(VideoDecoderMessage::GetFrame(_, _, reply)) =
+                                    requests.recv()
+                                {
+                                    let _ = reply.send(DecodedFrame::new(vec![73; 16], 2, 2));
+                                }
+                            }
+                            TerminalWorkerCommand::Fail(error) => {
+                                worker_control.fail(error);
+                            }
+                            TerminalWorkerCommand::Finish => break,
+                        }
+                    }
+                    let _ = released.recv();
+                });
+            });
+            *control.join.lock().unwrap() = Some(join);
+            let worker = ManagedVideoStopHandle { control, wake };
+            let mut decoder = pending_decoder(worker.clone());
+            decoder.ready = Some(ready_receiver);
+            (
+                decoder,
+                TerminalWorkerDriver {
+                    worker,
+                    commands,
+                    release,
+                    dropped,
+                },
+            )
+        }
+
+        async fn ready_segment() -> (
+            ManagedRecordingSegmentDecoders,
+            TerminalWorkerDriver,
+            TerminalWorkerDriver,
+        ) {
+            let (display, display_driver) = terminal_worker();
+            let (camera, camera_driver) = terminal_worker();
+            let mut segment = ManagedRecordingSegmentDecoders::from_test_workers(display, camera);
+            let status = tokio::time::timeout(Duration::from_secs(5), segment.wait_ready())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (status.display.video_width, status.display.video_height),
+                (2, 2)
+            );
+            assert_eq!(
+                status.camera.unwrap().decoder_type,
+                DecoderType::FFmpegSoftware
+            );
+            display_driver.assert_healthy();
+            camera_driver.assert_healthy();
+            (segment, display_driver, camera_driver)
+        }
+
+        async fn reply_frames(
+            segment: &ManagedRecordingSegmentDecoders,
+            display: &TerminalWorkerDriver,
+            camera: &TerminalWorkerDriver,
+        ) -> crate::DecodedSegmentFrames {
+            display.reply_frame();
+            camera.reply_frame();
+            let frames = tokio::time::timeout(
+                Duration::from_secs(5),
+                segment.get_frames(0.0, true, true, Default::default()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            for frame in [&frames.screen_frame, &frames.camera_frame] {
+                let frame = frame.as_ref().unwrap();
+                assert_eq!(
+                    (frame.width(), frame.height(), frame.byte_len()),
+                    (2, 2, 16)
+                );
+                assert_eq!(frame.data(), &[73; 16]);
+            }
+            frames
+        }
+
+        async fn join_both(
+            segment: &ManagedRecordingSegmentDecoders,
+            display: &TerminalWorkerDriver,
+            camera: &TerminalWorkerDriver,
+        ) -> ManagedSegmentVideoExit {
+            let stops = segment.stop_handles();
+            let mut first = Box::pin(segment.stop_and_wait());
+            let mut second = Box::pin(stops.stop_and_wait());
+            assert!(futures::poll!(&mut first).is_pending());
+            assert!(futures::poll!(&mut second).is_pending());
+            for driver in [display, camera] {
+                assert!(!driver.dropped.load(Ordering::Acquire));
+                assert!(driver.worker.control.state.borrow().exit.is_none());
+            }
+            display.release();
+            camera.release();
+            let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(first, second)
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                first.display.as_ref().unwrap().terminal,
+                second.display.unwrap().terminal
+            );
+            assert_eq!(
+                first.camera.as_ref().unwrap().terminal,
+                second.camera.unwrap().terminal
+            );
+            for driver in [display, camera] {
+                assert!(driver.dropped.load(Ordering::Acquire));
+                assert!(driver.worker.control.state.borrow().exit.is_some());
+                assert!(driver.worker.control.join.lock().unwrap().is_none());
+            }
+            first
+        }
+
+        async fn idle_terminal_failure(camera_fails: bool, decoded_frame_retained: bool) {
+            let (segment, display, camera) = ready_segment().await;
+            let retained = if decoded_frame_retained {
+                Some(reply_frames(&segment, &display, &camera).await)
+            } else {
+                None
+            };
+            let mut observer = Box::pin(segment.wait_for_terminal());
+            assert!(futures::poll!(&mut observer).is_pending());
+            let native_error = ManagedVideoError::Decode("Controlled idle source failure".into());
+            let expected = if camera_fails {
+                camera.fail(native_error.clone());
+                ManagedSegmentVideoError::Camera(native_error.clone())
+            } else {
+                display.fail(native_error.clone());
+                ManagedSegmentVideoError::Display(native_error.clone())
+            };
+            let observed = tokio::time::timeout(Duration::from_secs(5), observer)
+                .await
+                .unwrap();
+            assert_eq!(observed, expected);
+            assert_eq!(segment.terminal_error(), Some(expected.clone()));
+            let healthy = if camera_fails { &display } else { &camera };
+            healthy.assert_healthy();
+            assert!(matches!(
+                segment.get_frames(0.0, false, false, Default::default()).await,
+                Err(actual) if actual == expected
+            ));
+            assert_eq!(segment.wait_for_terminal().await, expected);
+            let exit = join_both(&segment, &display, &camera).await;
+            let (failed, cancelled) = if camera_fails {
+                (exit.camera.unwrap(), exit.display.unwrap())
+            } else {
+                (exit.display.unwrap(), exit.camera.unwrap())
+            };
+            assert_eq!(failed.terminal, native_error);
+            assert_eq!(cancelled.terminal, ManagedVideoError::Cancelled);
+            assert_eq!(segment.terminal_error(), Some(expected.clone()));
+            assert_eq!(segment.wait_for_terminal().await, expected);
+            drop(retained);
+        }
+
+        #[tokio::test]
+        async fn managed_segment_terminal_wait_observes_display_idle_failure_after_ready() {
+            idle_terminal_failure(false, false).await;
+        }
+
+        #[tokio::test]
+        async fn managed_segment_terminal_wait_observes_camera_idle_failure_after_ready() {
+            idle_terminal_failure(true, false).await;
+        }
+
+        #[tokio::test]
+        async fn managed_segment_terminal_wait_observes_decode_ahead_failure_with_retained_frame() {
+            idle_terminal_failure(true, true).await;
+        }
+
+        #[tokio::test]
+        async fn managed_segment_dropped_and_cancelled_terminal_waiters_leave_both_workers_healthy()
+        {
+            let (segment, display, camera) = ready_segment().await;
+            let mut dropped = Box::pin(segment.wait_for_terminal());
+            assert!(futures::poll!(&mut dropped).is_pending());
+            drop(dropped);
+            let mut cancelled = Box::pin(segment.wait_for_terminal());
+            assert!(futures::poll!(&mut cancelled).is_pending());
+            tokio::select! {
+                error = &mut cancelled => panic!("Healthy terminal waiter completed: {error:?}"),
+                _ = std::future::ready(()) => {},
+            }
+            drop(cancelled);
+            display.assert_healthy();
+            camera.assert_healthy();
+            drop(reply_frames(&segment, &display, &camera).await);
+            display.assert_healthy();
+            camera.assert_healthy();
+            let exit = join_both(&segment, &display, &camera).await;
+            assert_eq!(exit.display.unwrap().terminal, ManagedVideoError::Cancelled);
+            assert_eq!(exit.camera.unwrap().terminal, ManagedVideoError::Cancelled);
+        }
+    }
+    use super::*;
+    use cap_enc_ffmpeg::segmented_stream::{SegmentedVideoEncoder, SegmentedVideoEncoderConfig};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn blocked_worker() -> (ManagedVideoStopHandle, mpsc::Sender<()>, Arc<AtomicBool>) {
+        let control = ManagedVideoControl::new();
+        let (wake, requests) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let worker_control = control.clone();
+        let worker_dropped = dropped.clone();
+        let join = std::thread::spawn(move || {
+            worker_control.run_worker(|| {
+                let _resource = DropSignal(worker_dropped);
+                let _ = requests.recv();
+                let _ = released.recv();
+            });
+        });
+        *control.join.lock().unwrap() = Some(join);
+        (ManagedVideoStopHandle { control, wake }, release, dropped)
+    }
+
+    fn pending_decoder(worker: ManagedVideoStopHandle) -> ManagedVideoDecoder {
+        ManagedVideoDecoder {
+            worker,
+            ready: None,
+            decoder: None,
+            offset: 0.0,
+            max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_concurrent_stop_waiters_observe_native_drop_and_join() {
+        let (worker, release, dropped) = blocked_worker();
+        let mut first = Box::pin(worker.stop_and_wait());
+        let mut second = Box::pin(worker.stop_and_wait());
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(worker.control.state.borrow().exit.is_none());
+        assert_eq!(
+            worker.wait_for_terminal().await,
+            ManagedVideoError::Cancelled
+        );
+        release.send(()).unwrap();
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.terminal, ManagedVideoError::Cancelled);
+        assert_eq!(second.terminal, first.terminal);
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(worker.control.join.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_dropped_stop_waiter_does_not_abandon_the_join() {
+        let (worker, release, dropped) = blocked_worker();
+        let mut first = Box::pin(worker.stop_and_wait());
+        assert!(futures::poll!(&mut first).is_pending());
+        drop(first);
+        assert!(!dropped.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker.stop_and_wait())
+            .await
+            .unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(worker.control.state.borrow().exit.is_some());
+    }
+
+    #[tokio::test]
+    async fn managed_dropped_readiness_future_cancels_but_retains_cleanup_owner() {
+        let (worker, release, dropped) = blocked_worker();
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let mut decoder = pending_decoder(worker.clone());
+        decoder.ready = Some(ready_receiver);
+        let mut readiness = Box::pin(decoder.wait_ready());
+        assert!(futures::poll!(&mut readiness).is_pending());
+        drop(readiness);
+        assert_eq!(
+            worker.wait_for_terminal().await,
+            ManagedVideoError::Cancelled
+        );
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(worker.control.state.borrow().exit.is_none());
+        drop(decoder);
+        drop(ready_sender);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker.stop_and_wait())
+            .await
+            .unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn managed_worker_panic_is_terminal_after_resource_drop_before_join_ack() {
+        let control = ManagedVideoControl::new();
+        let (wake, requests) = mpsc::channel();
+        let worker_control = control.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let worker_dropped = dropped.clone();
+        let join = std::thread::spawn(move || {
+            worker_control.run_worker(|| {
+                let _resource = DropSignal(worker_dropped);
+                drop(requests);
+                panic!("Managed worker panic probe");
+            });
+        });
+        *control.join.lock().unwrap() = Some(join);
+        let worker = ManagedVideoStopHandle { control, wake };
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), worker.wait_for_terminal())
+                .await
+                .unwrap(),
+            ManagedVideoError::WorkerPanicked
+        );
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(worker.control.state.borrow().exit.is_none());
+        assert_eq!(
+            worker.stop_and_wait().await.terminal,
+            ManagedVideoError::WorkerPanicked
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_terminal_error_is_preserved_through_cancel_and_unready_requests() {
+        let (worker, release, _) = blocked_worker();
+        let error = ManagedVideoError::Decode("Source identity changed".to_string());
+        worker.control.fail(error.clone());
+        let decoder = pending_decoder(worker.clone());
+        assert!(matches!(decoder.get_frame(0.0).await, Err(actual) if actual == error));
+        assert!(matches!(decoder.get_frame_initial(0.0).await, Err(actual) if actual == error));
+        worker.cancel();
+        assert_eq!(worker.wait_for_terminal().await, error);
+        release.send(()).unwrap();
+        assert_eq!(worker.stop_and_wait().await.terminal, error);
+    }
+
+    fn encode_gapped_segments(directory: &std::path::Path) -> Vec<PathBuf> {
+        ::ffmpeg::init().unwrap();
+        let mut encoder = SegmentedVideoEncoder::init(
+            directory.to_path_buf(),
+            cap_media_info::VideoInfo {
+                pixel_format: cap_media_info::Pixel::NV12,
+                width: 160,
+                height: 120,
+                time_base: Rational(1, 1_000_000),
+                frame_rate: Rational(30, 1),
+            },
+            SegmentedVideoEncoderConfig {
+                segment_duration: Duration::from_secs(1),
+                bpp: 4.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut noise = 123456789_u32;
+        for index in (0..90_u64).chain(180..300) {
+            let mut frame = ::ffmpeg::frame::Video::new(::ffmpeg::format::Pixel::NV12, 160, 120);
+            for byte in frame.data_mut(0) {
+                noise ^= noise << 13;
+                noise ^= noise >> 17;
+                noise ^= noise << 5;
+                *byte = (noise % 220 + 16) as u8;
+            }
+            frame.data_mut(1).fill(128);
+            encoder
+                .queue_frame(frame, Duration::from_micros(index * 1_000_000 / 30))
+                .unwrap();
+        }
+        encoder.finish().unwrap();
+        let mut paths = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "m4s"))
+            .map(|path| PathBuf::from(path.file_name().unwrap()))
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert!(paths.len() >= 3);
+        assert!(
+            std::fs::metadata(directory.join(paths.last().unwrap()))
+                .unwrap()
+                .len()
+                > 65_536
+        );
+        paths.insert(0, PathBuf::from("init.mp4"));
+        paths
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn stalled_native_decoder_falls_back_once_and_preserves_offsets_across_clones() {
+        let directory = tempfile::tempdir().unwrap();
+        encode_gapped_segments(directory.path());
+        let (sender, receiver) = mpsc::channel();
+        let decoder = AsyncVideoDecoderHandle {
+            sender,
+            offset: 0.25,
+            status: DecoderStatus {
+                decoder_type: DecoderType::AVAssetReader,
+                video_width: 160,
+                video_height: 120,
+                fallback_reason: None,
+            },
+            max_fallback_distance: 2,
+            fallback: Some(Arc::new(MacOsDecoderFallback {
+                name: "screen",
+                path: directory.path().to_path_buf(),
+                fps: 30,
+                decoder: tokio::sync::OnceCell::new(),
+            })),
+        };
+        let cloned = decoder.clone();
+        let (first, second) = tokio::join!(
+            decoder.get_frame_with_timeout(0.0, 200, 2),
+            cloned.get_frame_with_timeout(0.0, 200, 2)
+        );
+        let first = first.unwrap();
+        assert_eq!(frame_pixels(&first), frame_pixels(&second.unwrap()));
+        assert_eq!(decoder.decoder_type(), DecoderType::FFmpegSoftware);
+        assert_eq!(cloned.decoder_type(), DecoderType::FFmpegSoftware);
+        assert!(decoder.fallback_reason().is_some());
+        let (reference, join) = ordinary_worker(directory.path().to_path_buf(), 0.25, false).await;
+        assert_eq!(
+            frame_pixels(&first),
+            frame_pixels(&reference.get_frame_initial(0.0).await.unwrap())
+        );
+        let pending_before = receiver.try_iter().count();
+        assert_eq!(pending_before, 2);
+        assert!(decoder.get_frame_initial(0.5).await.is_some());
+        assert_eq!(receiver.try_iter().count(), 0);
+        drop(reference);
+        join.join().unwrap();
+    }
+
+    async fn ordinary_worker(
+        path: PathBuf,
+        offset: f64,
+        hardware: bool,
+    ) -> (AsyncVideoDecoderHandle, std::thread::JoinHandle<()>) {
+        ordinary_worker_with_fps(path, offset, hardware, 30).await
+    }
+
+    async fn ordinary_worker_with_fps(
+        path: PathBuf,
+        offset: f64,
+        hardware: bool,
+        fps: u32,
+    ) -> (AsyncVideoDecoderHandle, std::thread::JoinHandle<()>) {
+        let (sender, receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let join = ffmpeg::FfmpegDecoder::spawn_ordinary_test_worker(
+            path,
+            fps,
+            receiver,
+            ready_sender,
+            hardware,
+        );
+        let initialized = tokio::time::timeout(Duration::from_secs(30), ready_receiver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        (
+            AsyncVideoDecoderHandle {
+                sender,
+                offset,
+                status: DecoderStatus {
+                    decoder_type: initialized.decoder_type,
+                    video_width: initialized.width,
+                    video_height: initialized.height,
+                    fallback_reason: None,
+                },
+                max_fallback_distance: DEFAULT_MAX_FALLBACK_DISTANCE,
+                #[cfg(target_os = "macos")]
+                fallback: None,
+            },
+            join,
+        )
+    }
+
+    fn frame_pixels(frame: &DecodedFrame) -> Vec<u8> {
+        let mut pixels = Vec::new();
+        let width = frame.width as usize;
+        let height = frame.height as usize;
+        let mut append_rows = |plane: &[u8], stride: usize, row_bytes: usize, rows: usize| {
+            for row in plane.chunks(stride).take(rows) {
+                pixels.extend_from_slice(&row[..row_bytes]);
+            }
+        };
+        match frame.format {
+            PixelFormat::Rgba => append_rows(frame.data(), width * 4, width * 4, height),
+            PixelFormat::Nv12 => {
+                append_rows(
+                    frame.y_plane().unwrap(),
+                    frame.y_stride as usize,
+                    width,
+                    height,
+                );
+                append_rows(
+                    frame.uv_plane().unwrap(),
+                    frame.uv_stride as usize,
+                    width,
+                    height / 2,
+                );
+            }
+            PixelFormat::Yuv420p => {
+                append_rows(
+                    frame.y_plane().unwrap(),
+                    frame.y_stride as usize,
+                    width,
+                    height,
+                );
+                append_rows(
+                    frame.u_plane().unwrap(),
+                    frame.uv_stride as usize,
+                    width / 2,
+                    height / 2,
+                );
+                append_rows(
+                    frame.v_plane().unwrap(),
+                    frame.uv_stride as usize,
+                    width / 2,
+                    height / 2,
+                );
+            }
+        }
+        let expected_bytes = match frame.format {
+            PixelFormat::Rgba => width * height * 4,
+            PixelFormat::Nv12 | PixelFormat::Yuv420p => width * height * 3 / 2,
+        };
+        assert_eq!(pixels.len(), expected_bytes);
+        pixels
+    }
+
+    async fn compare_gapped_workers(hardware: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let reference = directory.path().join("reference");
+        let retained = directory.path().join("retained");
+        let paths = encode_gapped_segments(&original);
+        std::fs::create_dir(&reference).unwrap();
+        for path in &paths {
+            std::fs::copy(original.join(path), reference.join(path)).unwrap();
+        }
+        let source = cap_enc_ffmpeg::RelocatableSource::new(original.clone()).unwrap();
+        let (ordinary, join) = ordinary_worker(reference, 0.25, hardware).await;
+        let mut managed = spawn_managed_decoder(
+            "gapped-test",
+            source.clone(),
+            paths.iter().map(PathBuf::as_path),
+            30,
+            0.25,
+            hardware,
+        )
+        .unwrap();
+        let status = managed.wait_ready().await.unwrap();
+        println!(
+            "{}",
+            serde_json::json!({
+                "probe": "managed-async-worker",
+                "hardwareRequested": hardware,
+                "ordinaryDecoder": ordinary.status.decoder_type.to_string(),
+                "managedDecoder": status.decoder_type.to_string(),
+                "width": status.video_width,
+                "height": status.video_height,
+                "offsetSeconds": 0.25,
+                "gapStartSeconds": 3.0,
+                "gapEndSeconds": 6.0,
+            })
+        );
+        assert_eq!(status.decoder_type, ordinary.status.decoder_type);
+        assert_eq!(status.video_width, ordinary.status.video_width);
+        assert_eq!(status.video_height, ordinary.status.video_height);
+        for cycle in 0..3 {
+            let destination = if cycle % 2 == 0 { &retained } else { &original };
+            source.relocate(destination.clone()).unwrap();
+            for time in [0.0, 2.6, 3.0, 4.0, 5.5, 6.0, 9.5, 0.5, 4.0, 8.0, 2.6] {
+                let expected = ordinary.get_frame_initial(time).await.unwrap();
+                let actual = managed.get_frame_initial(time).await.unwrap();
+                assert_eq!(
+                    (actual.width, actual.height, actual.format),
+                    (expected.width, expected.height, expected.format),
+                    "cycle {cycle}, time {time}"
+                );
+                assert_eq!(
+                    frame_pixels(&actual),
+                    frame_pixels(&expected),
+                    "cycle {cycle}, time {time}"
+                );
+            }
+        }
+        let exit = managed.stop_and_wait().await;
+        assert_eq!(exit.terminal, ManagedVideoError::Cancelled);
+        drop(managed);
+        drop(ordinary);
+        tokio::task::spawn_blocking(move || join.join().unwrap())
+            .await
+            .unwrap();
+        for path in &paths {
+            assert_eq!(
+                std::fs::read(retained.join(path)).unwrap(),
+                std::fs::read(directory.path().join("reference").join(path)).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_async_worker_preserves_software_frames_offsets_seeks_and_vfr_holds() {
+        compare_gapped_workers(false).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn managed_async_worker_preserves_hardware_frames_offsets_seeks_and_vfr_holds() {
+        compare_gapped_workers(true).await;
+    }
+
+    fn last_fragment_request_time(directory: &std::path::Path, paths: &[PathBuf], fps: u32) -> f32 {
+        let last_start = paths[..paths.len() - 1]
+            .iter()
+            .map(|path| std::fs::metadata(directory.join(path)).unwrap().len())
+            .sum::<u64>();
+        let absolute_paths = paths
+            .iter()
+            .map(|path| directory.join(path))
+            .collect::<Vec<_>>();
+        let mut input =
+            cap_enc_ffmpeg::SegmentedInput::open(absolute_paths.iter().map(PathBuf::as_path))
+                .unwrap();
+        let (stream_index, start_time, time_base) = {
+            let stream = input
+                .input()
+                .streams()
+                .best(::ffmpeg::media::Type::Video)
+                .unwrap();
+            (stream.index(), stream.start_time(), stream.time_base())
+        };
+        let mut packet = ::ffmpeg::Packet::empty();
+        loop {
+            input.read_packet(&mut packet).unwrap();
+            if packet.stream() == stream_index
+                && u64::try_from(packet.position()).is_ok_and(|position| position >= last_start)
+            {
+                let pts = packet.pts().unwrap();
+                let frame = pts_to_frame(pts.checked_sub(start_time).unwrap(), time_base, fps);
+                let requested_time = ((f64::from(frame) + 0.25) / f64::from(fps)) as f32;
+                assert_eq!((requested_time * fps as f32).floor() as u32, frame);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "probe": "missing-fragment-target",
+                        "fragment": paths.last().unwrap(),
+                        "fragmentStartBytes": last_start,
+                        "packetPosition": packet.position(),
+                        "packetPts": pts,
+                        "streamStart": start_time,
+                        "timeBase": [time_base.numerator(), time_base.denominator()],
+                        "renderFrame": frame,
+                        "requestedTime": requested_time,
+                    })
+                );
+                return requested_time;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_async_worker_missing_lazy_fragment_is_terminal_without_fallback_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let retained = directory.path().join("retained");
+        let paths = encode_gapped_segments(&original);
+        let requested_time = last_fragment_request_time(&original, &paths, 30);
+        let source = cap_enc_ffmpeg::RelocatableSource::new(original).unwrap();
+        let mut input_probe = cap_enc_ffmpeg::SegmentedInput::open_relocatable(
+            &source,
+            paths.iter().map(PathBuf::as_path),
+        )
+        .unwrap();
+        let mut managed = spawn_managed_decoder(
+            "missing-fragment-test",
+            source.clone(),
+            paths.iter().map(PathBuf::as_path),
+            30,
+            0.0,
+            false,
+        )
+        .unwrap();
+        managed.wait_ready().await.unwrap();
+        let initial = managed.get_frame_initial(0.0).await.unwrap();
+        assert!(!frame_pixels(&initial).is_empty());
+        source.relocate(retained.clone()).unwrap();
+        std::fs::remove_file(retained.join(paths.last().unwrap())).unwrap();
+        let input_error = loop {
+            match input_probe.read_packet(&mut ::ffmpeg::Packet::empty()) {
+                Ok(()) => {}
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            input_probe.io_error().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(
+            matches!(input_error, ::ffmpeg::Error::Other { errno } if errno == ::ffmpeg::ffi::EIO)
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "probe": "missing-fragment-io-error",
+                "error": input_error.to_string(),
+                "sourceError": input_probe.io_error().unwrap().to_string(),
+            })
+        );
+        let error = managed
+            .get_frame_initial(requested_time)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                error,
+                ManagedVideoError::Decode(_) | ManagedVideoError::Seek(_)
+            ),
+            "{error:?}"
+        );
+        assert!(matches!(managed.get_frame(0.0).await, Err(actual) if actual == error));
+        assert_eq!(managed.stop_handle().wait_for_terminal().await, error);
+        assert_eq!(managed.stop_and_wait().await.terminal, error);
+    }
+    fn segment_wrapper_metadata(camera: bool) -> cap_project::StudioRecordingMeta {
+        serde_json::from_value(serde_json::json!({
+            "segments": [{
+                "display": {"path":"display.mp4", "fps":30, "start_time":10.0},
+                "camera": camera.then(|| serde_json::json!({"path":"camera.mp4", "fps":24, "start_time":10.125})),
+                "mic": {"path":"mic.aac", "start_time":10.25}
+            }]
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn managed_segment_matches_ordinary_camera_offsets_masks_gaps_and_relocation() {
+        use crate::{
+            ManagedRecordingSegmentDecoders, ManagedSegmentVideoInput, ManagedVideoTrackInput,
+            RecordingSegmentDecoders,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let retained = directory.path().join("retained");
+        let reference = directory.path().join("reference");
+        let paths = encode_gapped_segments(&original);
+        std::fs::create_dir(&reference).unwrap();
+        for path in &paths {
+            std::fs::copy(original.join(path), reference.join(path)).unwrap();
+        }
+        let source = cap_enc_ffmpeg::RelocatableSource::new(original.clone()).unwrap();
+        let (display, display_join) =
+            ordinary_worker_with_fps(reference.clone(), 0.25, false, 30).await;
+        let (camera, camera_join) = ordinary_worker_with_fps(reference, 0.125, false, 24).await;
+        let ordinary = RecordingSegmentDecoders {
+            screen: display.with_max_fallback_distance(crate::SCREEN_MAX_FALLBACK_DISTANCE),
+            camera: Some(camera.with_max_fallback_distance(crate::CAMERA_MAX_FALLBACK_DISTANCE)),
+            segment_offset: 10.25,
+        };
+        let input = ManagedSegmentVideoInput::new(
+            0,
+            &segment_wrapper_metadata(true),
+            ManagedVideoTrackInput::new(source.clone(), paths.clone()).unwrap(),
+            Some(ManagedVideoTrackInput::new(source.clone(), paths.clone()).unwrap()),
+        )
+        .unwrap();
+        let mut managed = ManagedRecordingSegmentDecoders::spawn(input, false);
+        let stops = managed.stop_handles();
+        let status = managed.wait_ready().await.unwrap();
+        assert_eq!(status.segment_index, 0);
+        assert_eq!(
+            (status.display.video_width, status.display.video_height),
+            ordinary.screen_video_dimensions()
+        );
+        assert_eq!(
+            status
+                .camera
+                .as_ref()
+                .map(|camera| (camera.video_width, camera.video_height)),
+            ordinary.camera_video_dimensions()
+        );
+        let offsets = cap_project::ClipOffsets {
+            camera: 0.125,
+            ..Default::default()
+        };
+        for cycle in 0..2 {
+            source
+                .relocate(if cycle == 0 {
+                    retained.clone()
+                } else {
+                    original.clone()
+                })
+                .unwrap();
+            for (time, needs_camera, needs_display) in [
+                (0.0, true, true),
+                (2.6, true, true),
+                (4.0, true, true),
+                (5.5, false, true),
+                (6.0, true, false),
+                (9.5, true, true),
+                (0.5, true, true),
+                (4.0, false, false),
+            ] {
+                let expected = if cycle == 0 {
+                    ordinary
+                        .get_frames_initial(time, needs_camera, needs_display, offsets)
+                        .await
+                } else {
+                    ordinary
+                        .get_frames(time, needs_camera, needs_display, offsets)
+                        .await
+                }
+                .unwrap();
+                let actual = if cycle == 0 {
+                    managed
+                        .get_frames_initial(time, needs_camera, needs_display, offsets)
+                        .await
+                } else {
+                    managed
+                        .get_frames(time, needs_camera, needs_display, offsets)
+                        .await
+                }
+                .unwrap();
+                assert_eq!(actual.screen_size, expected.screen_size);
+                assert_eq!(
+                    actual.segment_time.to_bits(),
+                    expected.segment_time.to_bits()
+                );
+                assert_eq!(
+                    actual.recording_time.to_bits(),
+                    expected.recording_time.to_bits()
+                );
+                assert_eq!(actual.segment_has_camera, expected.segment_has_camera);
+                for (actual, expected) in [
+                    (actual.screen_frame, expected.screen_frame),
+                    (actual.camera_frame, expected.camera_frame),
+                ] {
+                    assert_eq!(actual.is_some(), expected.is_some());
+                    if let (Some(actual), Some(expected)) = (actual, expected) {
+                        assert_eq!(
+                            (actual.width, actual.height, actual.format),
+                            (expected.width, expected.height, expected.format)
+                        );
+                        assert_eq!(frame_pixels(&actual), frame_pixels(&expected));
+                    }
+                }
+            }
+        }
+        let (first, second) = tokio::join!(managed.stop_and_wait(), stops.stop_and_wait());
+        assert_eq!(
+            first.display.unwrap().terminal,
+            ManagedVideoError::Cancelled
+        );
+        assert_eq!(first.camera.unwrap().terminal, ManagedVideoError::Cancelled);
+        assert_eq!(
+            second.display.unwrap().terminal,
+            ManagedVideoError::Cancelled
+        );
+        assert_eq!(
+            second.camera.unwrap().terminal,
+            ManagedVideoError::Cancelled
+        );
+        drop(managed);
+        drop(ordinary);
+        tokio::task::spawn_blocking(move || {
+            display_join.join().unwrap();
+            camera_join.join().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_segment_missing_camera_joins_both_workers_and_never_returns_display_only() {
+        use crate::{
+            ManagedRecordingSegmentDecoders, ManagedSegmentVideoError, ManagedSegmentVideoInput,
+            ManagedVideoTrackInput,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let paths = encode_gapped_segments(&original);
+        let source = cap_enc_ffmpeg::RelocatableSource::new(original).unwrap();
+        let input = ManagedSegmentVideoInput::new(
+            0,
+            &segment_wrapper_metadata(true),
+            ManagedVideoTrackInput::new(source.clone(), paths).unwrap(),
+            Some(
+                ManagedVideoTrackInput::new(source, vec![PathBuf::from("missing-init.mp4")])
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let mut managed = ManagedRecordingSegmentDecoders::spawn(input, false);
+        let stops = managed.stop_handles();
+        let error = managed.wait_ready().await.unwrap_err();
+        assert!(
+            matches!(error, ManagedSegmentVideoError::Camera(_)),
+            "{error:?}"
+        );
+        assert_eq!(managed.terminal_error(), Some(error.clone()));
+        assert!(
+            matches!(managed.get_frames_initial(0.0, false, true, Default::default()).await, Err(actual) if actual == error)
+        );
+        let (first, second) = tokio::join!(managed.stop_and_wait(), stops.stop_and_wait());
+        assert!(first.display.is_some() && first.camera.is_some());
+        assert!(second.display.is_some() && second.camera.is_some());
+    }
+
+    #[tokio::test]
+    async fn managed_segment_readiness_drop_cancels_both_and_retained_handles_join_after_owner_drop()
+     {
+        use crate::ManagedRecordingSegmentDecoders;
+        let (display_worker, display_release, display_dropped) = blocked_worker();
+        let (camera_worker, camera_release, camera_dropped) = blocked_worker();
+        let (display_sender, display_receiver) = oneshot::channel();
+        let (camera_sender, camera_receiver) = oneshot::channel();
+        let mut display = pending_decoder(display_worker.clone());
+        let mut camera = pending_decoder(camera_worker.clone());
+        display.ready = Some(display_receiver);
+        camera.ready = Some(camera_receiver);
+        let mut managed = ManagedRecordingSegmentDecoders::from_test_workers(display, camera);
+        let stops = managed.stop_handles();
+        let mut readiness = Box::pin(managed.wait_ready());
+        assert!(futures::poll!(&mut readiness).is_pending());
+        drop(readiness);
+        assert_eq!(
+            display_worker.terminal_error(),
+            Some(ManagedVideoError::Cancelled)
+        );
+        assert_eq!(
+            camera_worker.terminal_error(),
+            Some(ManagedVideoError::Cancelled)
+        );
+        assert!(!display_dropped.load(Ordering::Acquire));
+        assert!(!camera_dropped.load(Ordering::Acquire));
+        drop(managed);
+        drop(display_sender);
+        drop(camera_sender);
+        let mut stopped = Box::pin(stops.stop_and_wait());
+        assert!(futures::poll!(&mut stopped).is_pending());
+        display_release.send(()).unwrap();
+        camera_release.send(()).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .unwrap();
+        assert_eq!(exit.display.unwrap().terminal, ManagedVideoError::Cancelled);
+        assert_eq!(exit.camera.unwrap().terminal, ManagedVideoError::Cancelled);
+        assert!(display_dropped.load(Ordering::Acquire));
+        assert!(camera_dropped.load(Ordering::Acquire));
+    }
+}
