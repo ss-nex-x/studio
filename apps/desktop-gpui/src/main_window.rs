@@ -5548,6 +5548,7 @@ impl MainWindow {
     }
 
     fn render_logo(&self) -> impl IntoElement {
+        use gpui::StyledImage as _;
         img(if self.theme.is_dark() {
             "brand/logo-full-dark.png"
         } else {

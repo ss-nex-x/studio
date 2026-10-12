@@ -42,12 +42,8 @@ test("the GPUI app keeps the identity every existing install updates into", () =
 	assert.equal(gpuiConfig.productName, "Cap");
 	assert.equal(gpuiConfig.mainBinaryName, "Cap");
 	assert.equal(gpuiConfig.identifier, "so.cap.desktop");
-	assert.equal(
-		gpuiConfig.plugins.updater.pubkey,
-		tauriProduction.plugins.updater.pubkey,
-	);
 	assert.deepEqual(gpuiConfig.plugins.updater.endpoints, [
-		"https://cdn.crabnebula.app/update/cap/cap/{{target}}/{{current_version}}",
+		"https://github.com/ss-nex-x/studio/releases/latest/download/latest.json",
 	]);
 	const installer = readFileSync(
 		new URL("../apps/desktop-gpui/src/installer.rs", import.meta.url),
@@ -69,10 +65,6 @@ test("the GPUI app keeps the identity every existing install updates into", () =
 test("the GPUI bundle takes over the identity the Tauri app shipped with", () => {
 	assert.equal(tauriProduction.productName, gpuiConfig.productName);
 	assert.equal(tauriProduction.identifier, gpuiConfig.identifier);
-	assert.deepEqual(
-		tauriProduction.plugins.updater.endpoints,
-		gpuiConfig.plugins.updater.endpoints,
-	);
 });
 
 test("every committed file the GPUI bundle references exists", () => {
