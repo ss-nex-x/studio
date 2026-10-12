@@ -1,0 +1,278 @@
+name: Release
+
+# Nex X Spark Studio releases: push a `v*` tag (or run this manually with a
+# version) to build the GPUI app, attach the installers to a GitHub release and
+# publish the Tauri `latest.json` the in-app updater reads from
+# releases/latest/download/latest.json.
+#
+# Required repository secrets: TAURI_SIGNING_PRIVATE_KEY and
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD (the updater key whose public half is
+# UPDATER_PUBLIC_KEY in apps/desktop-gpui/src/installer.rs). Builds are not
+# Apple-notarized or Authenticode-signed.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 0.7.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          version="${VERSION#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$VERSION' is not a semver version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Nex X Spark Studio ${{ steps.version.outputs.version }}
+          draft: true
+          generate_release_notes: true
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.settings.runner }}
+    env:
+      APP_VERSION: ${{ needs.draft.outputs.version }}
+      TAG: ${{ needs.draft.outputs.tag }}
+      BUNDLE: apps/desktop-gpui/target/${{ matrix.settings.target }}/release/bundle
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop dependencies
+        if: ${{ runner.os == 'Linux' }}
+        uses: ./.github/actions/install-desktop-deps
+
+      - name: Rust setup
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: ${{ matrix.settings.target }}
+          prefix-key: v1-rust-release
+          save-cache: true
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            apps/desktop-gpui -> target
+
+      - name: Stamp build version
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = "apps/desktop/src-tauri/Cargo.toml";
+            let toml = fs.readFileSync(path, "utf8");
+            const re = /^version = ".*"$/m;
+            if (!re.test(toml)) {
+              console.error("package.version line not found in " + path);
+              process.exit(1);
+            }
+            fs.writeFileSync(path, toml.replace(re, "version = \"" + process.env.APP_VERSION + "\""));
+          '
+          node scripts/sync-desktop-versions.mjs
+
+      - uses: ./.github/actions/setup-js
+
+      - name: Create .env file in root
+        shell: bash
+        run: |
+          {
+            echo "appVersion=$APP_VERSION"
+            echo "VITE_ENVIRONMENT=production"
+            echo "RUST_TARGET_TRIPLE=${{ matrix.settings.target }}"
+          } >> .env
+
+      - name: Run cap-setup
+        shell: bash
+        run: bun run cap-setup
+        env:
+          RUST_TARGET_TRIPLE: ${{ matrix.settings.target }}
+
+      - name: Build desktop binaries
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: ./scripts/build-desktop-binaries.sh ${{ matrix.settings.target }}
+
+      - name: Increase swap space (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          sudo swapoff /mnt/swapfile 2>/dev/null || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+
+      - name: Increase pagefile size (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7f4a7b8708 # v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 24GB
+          disk-root: "D:"
+
+      - name: Build Nex X Spark Studio
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) node scripts/build-linux-packages.mjs "$TARGET" --verbose ;;
+            macOS) node scripts/bundle-gpui.mjs "$TARGET" --bundles app,dmg ;;
+            Windows) node scripts/bundle-gpui.mjs "$TARGET" --bundles nsis ;;
+          esac
+        env:
+          TARGET: ${{ matrix.settings.target }}
+          CI: false
+          LD_LIBRARY_PATH: ${{ runner.os == 'Linux' && format('{0}/apps/desktop-gpui/target/{1}/release:{0}/target/native-deps/lib', github.workspace, matrix.settings.target) || '' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          RUST_TARGET_TRIPLE: ${{ matrix.settings.target }}
+
+      - name: Collect release assets and updater entries
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p release-assets updater
+          one() {
+            if [[ $# -ne 1 || ! -s "$1" ]]; then
+              echo "::error::Expected exactly one release asset, found $# ($*)" >&2
+              exit 1
+            fi
+            printf '%s' "$1"
+          }
+          entry() {
+            local platform="$1" file="$2"
+            if [[ ! -s "$file.sig" ]]; then
+              echo "::error::Missing updater signature for $file" >&2
+              exit 1
+            fi
+            cp "$file" "$file.sig" release-assets/
+            node -e '
+              const [platform, name, sigPath, repo, tag] = process.argv.slice(1);
+              const fs = require("fs");
+              const entry = {
+                [platform]: {
+                  url: `https://github.com/${repo}/releases/download/${tag}/${encodeURIComponent(name)}`,
+                  signature: fs.readFileSync(sigPath, "utf8").trim(),
+                },
+              };
+              fs.writeFileSync(`updater/${platform}.json`, JSON.stringify(entry));
+            ' "$platform" "$(basename "$file")" "$file.sig" "$GITHUB_REPOSITORY" "$TAG"
+          }
+          case "$RUNNER_OS" in
+            macOS)
+              cp "$(one "$BUNDLE"/dmg/*.dmg)" release-assets/
+              entry darwin-aarch64 "$(one "$BUNDLE"/macos/*.app.tar.gz)"
+              ;;
+            Windows)
+              entry windows-x86_64 "$(one "$BUNDLE"/nsis/*.exe)"
+              ;;
+            Linux)
+              entry linux-x86_64-deb "$(one "$BUNDLE"/deb/*.deb)"
+              entry linux-x86_64-appimage "$(one "$BUNDLE"/appimage/*.AppImage)"
+              for rpm in "$BUNDLE"/rpm/*.rpm; do cp "$rpm" release-assets/; done
+              ;;
+          esac
+          ls -la release-assets updater
+
+      - name: Upload assets to the draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.draft.outputs.tag }}
+          draft: true
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
+      - name: Keep updater entries for latest.json
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: updater-${{ matrix.settings.target }}
+          path: updater/*.json
+          if-no-files-found: error
+
+  publish:
+    needs: [draft, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download updater entries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: updater-*
+          path: updater
+          merge-multiple: true
+
+      - name: Write latest.json
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const [version, tag, repo] = process.argv.slice(1);
+            const platforms = {};
+            for (const file of fs.readdirSync("updater")) {
+              Object.assign(platforms, JSON.parse(fs.readFileSync(`updater/${file}`, "utf8")));
+            }
+            const manifest = {
+              version,
+              notes: `See https://github.com/${repo}/releases/tag/${tag}`,
+              pub_date: new Date().toISOString(),
+              platforms,
+            };
+            fs.writeFileSync("latest.json", JSON.stringify(manifest, null, 2));
+            console.log(JSON.stringify(manifest, null, 2));
+          ' "${{ needs.draft.outputs.version }}" "${{ needs.draft.outputs.tag }}" "$GITHUB_REPOSITORY"
+
+      - name: Publish the release with latest.json
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.draft.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(needs.draft.outputs.version, '-') }}
+          files: latest.json
+          fail_on_unmatched_files: true

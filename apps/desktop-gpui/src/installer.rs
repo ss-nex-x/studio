@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
     time::Duration,
@@ -12,8 +13,10 @@ use serde::Deserialize;
 
 use crate::store::UpdateChannel;
 
-const UPDATE_ENDPOINT: &str = "https://cdn.crabnebula.app/update/cap/cap";
-const UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUyOTAzOTdFNzJFQkRFOTMKUldTVDN1dHlmam1RNHFXb1VYTXlrQk1iMFFkcjN0YitqZlA5WnZNY0ZtQ1dvM1dxK211M3VIYUQK";
+/// The Tauri `latest.json` the release workflow attaches to every GitHub
+/// release; `releases/latest/download/` always resolves to the newest one.
+const UPDATE_MANIFEST: &str = "https://github.com/ss-nex-x/studio/releases/latest/download/latest.json";
+const UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQyN0RBRDU1QjVGMDMyNzEKUldSeE12QzFWYTE5MHMrSys0UkFsZDFvYk8rbGsrVVVKSDdpeTBGczJBSnpZVTNReHhMTnBTS1gK";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(20);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -87,12 +90,17 @@ impl ArtifactKind {
 }
 
 #[derive(Deserialize)]
-struct RemoteRelease {
+struct Manifest {
     version: String,
-    url: String,
-    signature: String,
     #[serde(default)]
     notes: Option<String>,
+    platforms: HashMap<String, ManifestPlatform>,
+}
+
+#[derive(Deserialize)]
+struct ManifestPlatform {
+    url: String,
+    signature: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,33 +111,29 @@ pub(crate) struct Release {
     pub(crate) notes: Option<String>,
 }
 
-fn parse_release(body: &[u8]) -> Result<Release, String> {
-    let remote: RemoteRelease = serde_json::from_slice(body)
+/// `None` when the newest release ships no build for this platform.
+fn parse_release(body: &[u8], platform: &str) -> Result<Option<Release>, String> {
+    let manifest: Manifest = serde_json::from_slice(body)
         .map_err(|error| format!("Invalid update response: {error}"))?;
-    let version = Version::parse(remote.version.trim().trim_start_matches('v'))
-        .map_err(|error| format!("Invalid update version {:?}: {error}", remote.version))?;
-    let url = reqwest::Url::parse(remote.url.trim())
+    let Some(entry) = manifest.platforms.get(platform) else {
+        return Ok(None);
+    };
+    let version = Version::parse(manifest.version.trim().trim_start_matches('v'))
+        .map_err(|error| format!("Invalid update version {:?}: {error}", manifest.version))?;
+    let url = reqwest::Url::parse(entry.url.trim())
         .map_err(|error| format!("Invalid update download URL: {error}"))?;
     if url.scheme() != "https" {
         return Err("Update downloads must use HTTPS".to_string());
     }
-    if remote.signature.trim().is_empty() {
+    if entry.signature.trim().is_empty() {
         return Err("The update has no signature".to_string());
     }
-    Ok(Release {
+    Ok(Some(Release {
         version,
         url: url.into(),
-        signature: remote.signature.trim().to_string(),
-        notes: remote.notes.filter(|notes| !notes.trim().is_empty()),
-    })
-}
-
-fn endpoint(platform: &str, channel: UpdateChannel, current: &Version) -> String {
-    let url = format!("{UPDATE_ENDPOINT}/{platform}/{current}");
-    match channel {
-        UpdateChannel::Stable => url,
-        UpdateChannel::Nightly => format!("{url}?channel=nightly"),
-    }
+        signature: entry.signature.trim().to_string(),
+        notes: manifest.notes.filter(|notes| !notes.trim().is_empty()),
+    }))
 }
 
 fn client() -> Result<reqwest::Client, String> {
@@ -140,19 +144,24 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|error| error.to_string())
 }
 
+/// GitHub releases have no separate nightly feed, so only the stable channel
+/// reads the manifest. Version filtering is the caller's (`updates::qualifies`).
 pub(crate) async fn fetch_release(
     channel: UpdateChannel,
-    current: &Version,
+    _current: &Version,
 ) -> Result<Option<Release>, String> {
+    if channel == UpdateChannel::Nightly {
+        return Ok(None);
+    }
     let platform = update_platform()?;
     let response = client()?
-        .get(endpoint(&platform, channel, current))
+        .get(UPDATE_MANIFEST)
         .timeout(METADATA_TIMEOUT)
         .send()
         .await
         .map_err(|error| error.to_string())?;
 
-    if response.status() == reqwest::StatusCode::NO_CONTENT {
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
 
@@ -162,7 +171,7 @@ pub(crate) async fn fetch_release(
         .bytes()
         .await
         .map_err(|error| error.to_string())?;
-    parse_release(&body).map(Some)
+    parse_release(&body, &platform)
 }
 
 fn decode_base64_text(value: &str, what: &str) -> Result<String, String> {
@@ -576,7 +585,7 @@ pub(crate) fn install_deb(package: &Path) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err("The package wasn't installed. Approve the system prompt, or install it from studio.nexxspark.com/download.".to_string())
+        Err("The package wasn't installed. Approve the system prompt, or install it from github.com/ss-nex-x/studio/releases.".to_string())
     }
 }
 
@@ -669,47 +678,44 @@ mod tests {
         let key = trusted_key(UPDATER_PUBLIC_KEY).unwrap();
         assert_eq!(
             key.untrusted_comment(),
-            Some("untrusted comment: minisign public key: E290397E72EBDE93")
+            Some("untrusted comment: minisign public key: D27DAD55B5F03271")
         );
     }
 
     #[test]
     fn release_metadata_requires_https_and_a_signature() {
+        fn manifest(version: &str, url: &str, signature: &str) -> Vec<u8> {
+            format!(
+                r#"{{"version":"{version}","notes":"","platforms":{{"darwin-aarch64":{{"url":"{url}","signature":"{signature}"}}}}}}"#
+            )
+            .into_bytes()
+        }
         let release = parse_release(
-            br#"{"version":"v0.7.0","notes":"","url":"https://cdn.crabnebula.app/asset/1","signature":"c2ln"}"#,
+            &manifest("v0.7.0", "https://github.com/ss-nex-x/studio/releases/download/v0.7.0/a", "c2ln"),
+            "darwin-aarch64",
         )
+        .unwrap()
         .unwrap();
         assert_eq!(release.version, Version::new(0, 7, 0));
         assert_eq!(release.notes, None);
         assert!(
-            parse_release(
-                br#"{"version":"0.7.0","url":"http://example.com/a","signature":"c2ln"}"#
-            )
-            .is_err()
-        );
-        assert!(
-            parse_release(br#"{"version":"0.7.0","url":"https://example.com/a","signature":" "}"#)
+            parse_release(&manifest("0.7.0", "http://example.com/a", "c2ln"), "darwin-aarch64")
                 .is_err()
         );
         assert!(
-            parse_release(
-                br#"{"version":"seven","url":"https://example.com/a","signature":"c2ln"}"#
-            )
-            .is_err()
+            parse_release(&manifest("0.7.0", "https://example.com/a", " "), "darwin-aarch64")
+                .is_err()
+        );
+        assert!(
+            parse_release(&manifest("seven", "https://example.com/a", "c2ln"), "darwin-aarch64")
+                .is_err()
         );
     }
 
     #[test]
-    fn endpoints_name_the_platform_version_and_channel() {
-        let current = Version::parse("0.6.2-nightly.4").unwrap();
-        assert_eq!(
-            endpoint("darwin-aarch64", UpdateChannel::Stable, &current),
-            "https://cdn.crabnebula.app/update/cap/cap/darwin-aarch64/0.6.2-nightly.4"
-        );
-        assert_eq!(
-            endpoint("windows-x86_64", UpdateChannel::Nightly, &current),
-            "https://cdn.crabnebula.app/update/cap/cap/windows-x86_64/0.6.2-nightly.4?channel=nightly"
-        );
+    fn a_release_without_this_platform_is_not_an_update() {
+        let body = br#"{"version":"0.7.0","platforms":{"windows-x86_64":{"url":"https://example.com/a","signature":"c2ln"}}}"#;
+        assert_eq!(parse_release(body, "darwin-aarch64"), Ok(None));
     }
 
     #[test]

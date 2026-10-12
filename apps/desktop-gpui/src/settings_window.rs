@@ -1850,7 +1850,7 @@ impl SettingsWindow {
                     .id("settings-previous-versions")
                     .child("View previous versions")
                     .hover(|style| style.text_color(theme.settings_text()))
-                    .on_click(|_, _, cx| cx.open_url("https://studio.nexxspark.com/download/versions")),
+                    .on_click(|_, _, cx| cx.open_url("https://github.com/ss-nex-x/studio/releases")),
             )
             .child(
                 div()
