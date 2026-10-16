@@ -2620,7 +2620,8 @@ mod tests {
 
     #[test]
     fn first_run_visits_every_platform_stage_and_back_never_opens_an_omitted_step() {
-        for (macos, expected) in [(true, 8), (false, 7)] {
+        let skipped = usize::from(crate::LOCAL_ONLY);
+        for (macos, expected) in [(true, 8 - skipped), (false, 7 - skipped)] {
             let first = Step::first(macos, false);
             let mut visited = vec![first];
             while let Some(next) = visited.last().unwrap().next(false, true) {
@@ -2633,6 +2634,7 @@ mod tests {
             }
             assert_eq!(first.previous(first), None);
             assert_eq!(visited.contains(&Step::Permissions), macos);
+            assert_eq!(visited.contains(&Step::Instant), !crate::LOCAL_ONLY);
         }
     }
 

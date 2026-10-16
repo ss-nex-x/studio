@@ -2313,7 +2313,7 @@ mod tests {
             "hints",
             Some(r#"{ "general_settings": { "transcriptionHints": ["Cap", "Acme"] } }"#),
         );
-        assert_eq!(transcription_hints(), ["Nex X Spark", "Acme"]);
+        assert_eq!(transcription_hints(), ["Cap", "Acme"]);
     }
 
     /// An absent `transcriptionHints` key shows the four defaults
