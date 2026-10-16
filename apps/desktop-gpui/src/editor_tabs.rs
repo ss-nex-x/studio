@@ -2903,6 +2903,14 @@ impl EditorWindow {
         let theme = self.theme;
         let status = ai_edit::status(&self.project_path);
         let running = status == Some(ai_edit::Status::Running);
+        let connection = ai_edit::connection();
+        if connection == ai_edit::ClaudeConnection::Unknown {
+            self.run_claude_action(ai_edit::ClaudeAction::Check, cx);
+        }
+        let ready = matches!(
+            &connection,
+            ai_edit::ClaudeConnection::Connected(account) if !account.needs_update
+        );
         let hint = if has_captions {
             format!(
                 "Opus 5.5 ({}) edits the whole video on your Claude Code login: cuts and \
@@ -2943,11 +2951,12 @@ impl EditorWindow {
                     "Auto-edit with Opus 5.5"
                 })
                 .full_width()
-                .disabled(running || !has_captions)
+                .disabled(running || !has_captions || !ready)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.ai_edit_clicked(window, cx);
                 })),
             );
+        column = column.child(self.render_claude_connection(&connection, cx));
         match status {
             Some(ai_edit::Status::Done(summary)) => {
                 column = column.child(
@@ -2970,7 +2979,151 @@ impl EditorWindow {
         column
     }
 
+    fn render_claude_connection(
+        &self,
+        connection: &ai_edit::ClaudeConnection,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        use ai_edit::{ClaudeAction, ClaudeConnection};
+        let theme = self.theme;
+        let error_color = Hsla::from(gpui::rgb(0xef4444));
+        let (text, color) = match connection {
+            ClaudeConnection::Unknown | ClaudeConnection::Checking => (
+                "Checking your Claude account...".to_string(),
+                Hsla::from(theme.gray_10),
+            ),
+            ClaudeConnection::Connecting => (
+                "Finish signing in to Claude in your browser...".to_string(),
+                Hsla::from(theme.gray_10),
+            ),
+            ClaudeConnection::NotInstalled => (
+                "Claude Code is not installed. Install it from claude.com/claude-code, then \
+                 press Refresh."
+                    .to_string(),
+                error_color,
+            ),
+            ClaudeConnection::LoggedOut => (
+                "Not connected. Sign in with your Claude account (no API key needed)."
+                    .to_string(),
+                Hsla::from(theme.gray_11),
+            ),
+            ClaudeConnection::Connected(account) => {
+                let who = account.email.as_deref().unwrap_or("your Claude account");
+                let plan = account
+                    .subscription_type
+                    .as_deref()
+                    .map(|plan| format!(" ({plan})"))
+                    .unwrap_or_default();
+                if account.needs_update {
+                    (
+                        format!(
+                            "Connected as {who}{plan}. Claude Code {} is too old for Opus 5.5; \
+                             update it.",
+                            account.version.as_deref().unwrap_or("")
+                        ),
+                        error_color,
+                    )
+                } else {
+                    (
+                        format!("Connected as {who}{plan}."),
+                        Hsla::from(theme.gray_11),
+                    )
+                }
+            }
+            ClaudeConnection::Failed(error) => (error.clone(), error_color),
+        };
+        let mut actions: Vec<(&'static str, &'static str, ui::ButtonVariant, ClaudeAction)> =
+            Vec::new();
+        match connection {
+            ClaudeConnection::LoggedOut | ClaudeConnection::Failed(_) => {
+                actions.push((
+                    "claude-connect",
+                    "Connect Claude account",
+                    ui::ButtonVariant::Primary,
+                    ClaudeAction::Login,
+                ));
+                actions.push((
+                    "claude-refresh",
+                    "Refresh",
+                    ui::ButtonVariant::Gray,
+                    ClaudeAction::Check,
+                ));
+            }
+            ClaudeConnection::NotInstalled => actions.push((
+                "claude-refresh",
+                "Refresh",
+                ui::ButtonVariant::Gray,
+                ClaudeAction::Check,
+            )),
+            ClaudeConnection::Connected(account) => {
+                if account.needs_update {
+                    actions.push((
+                        "claude-update",
+                        "Update Claude Code",
+                        ui::ButtonVariant::Primary,
+                        ClaudeAction::Update,
+                    ));
+                }
+                actions.push((
+                    "claude-disconnect",
+                    "Disconnect",
+                    ui::ButtonVariant::Gray,
+                    ClaudeAction::Logout,
+                ));
+            }
+            ClaudeConnection::Unknown
+            | ClaudeConnection::Checking
+            | ClaudeConnection::Connecting => {}
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().text_size(px(12.)).text_color(color).child(text))
+            .child(div().flex().flex_row().gap(px(8.)).children(actions.into_iter().map(
+                |(id, label, variant, action)| {
+                    ui::Button::plain(&theme, id, variant, ui::ButtonSize::Sm)
+                        .label(label)
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.run_claude_action(action, cx);
+                            cx.notify();
+                        }))
+                },
+            )))
+    }
+
+    fn run_claude_action(&self, action: ai_edit::ClaudeAction, cx: &mut Context<Self>) {
+        ai_edit::set_connection(if action == ai_edit::ClaudeAction::Login {
+            ai_edit::ClaudeConnection::Connecting
+        } else {
+            ai_edit::ClaudeConnection::Checking
+        });
+        cx.spawn(async move |this, cx| {
+            let connection = cx
+                .background_executor()
+                .spawn(async move { ai_edit::run_claude_action_blocking(action) })
+                .await;
+            ai_edit::set_connection(connection);
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
     pub(crate) fn ai_edit_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match ai_edit::connection() {
+            ai_edit::ClaudeConnection::Connected(account) if !account.needs_update => {}
+            ai_edit::ClaudeConnection::Unknown => {}
+            _ => {
+                ai_edit::finish(
+                    &self.project_path,
+                    Err("Connect your Claude account in the AI Video Edit panel first."
+                        .to_string()),
+                );
+                self.sidebar.tab = crate::editor_sidebar::SidebarTab::Captions;
+                cx.notify();
+                return;
+            }
+        }
         let Some(summary) = self.summary() else {
             return;
         };

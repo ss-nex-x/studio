@@ -587,6 +587,160 @@ pub fn parse_cli_output(body: &Value) -> Result<EditPlan, String> {
     serde_json::from_value(plan).map_err(|error| format!("The edit plan was malformed: {error}"))
 }
 
+/// Opus 5.5 needs this Claude Code release or newer.
+const MIN_CLAUDE_CODE_VERSION: (u32, u32, u32) = (2, 1, 280);
+const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeAccount {
+    #[serde(default)]
+    pub logged_in: bool,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub subscription_type: Option<String>,
+    #[serde(skip)]
+    pub version: Option<String>,
+    #[serde(skip)]
+    pub needs_update: bool,
+}
+
+/// The Claude Code login the AI edit runs on. It is the CLI's own OAuth
+/// session (`claude auth login`), so the app never sees a token or an API key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaudeConnection {
+    Unknown,
+    Checking,
+    Connecting,
+    NotInstalled,
+    LoggedOut,
+    Connected(ClaudeAccount),
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaudeAction {
+    Check,
+    Login,
+    Logout,
+    Update,
+}
+
+static CONNECTION: LazyLock<Mutex<ClaudeConnection>> =
+    LazyLock::new(|| Mutex::new(ClaudeConnection::Unknown));
+
+pub fn connection() -> ClaudeConnection {
+    CONNECTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+pub fn set_connection(connection: ClaudeConnection) {
+    *CONNECTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection;
+}
+
+fn claude_command(claude: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(claude);
+    command
+        .args(args)
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let version = text.split_whitespace().next()?;
+    let mut parts = version.split('.').map(|part| part.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+fn check_connection(claude: &Path) -> ClaudeConnection {
+    let output = match claude_command(claude, &["auth", "status", "--json"]).output() {
+        Ok(output) => output,
+        Err(error) => return ClaudeConnection::Failed(format!("Could not run Claude Code: {error}")),
+    };
+    let mut account: ClaudeAccount =
+        match serde_json::from_slice(String::from_utf8_lossy(&output.stdout).trim().as_bytes()) {
+            Ok(account) => account,
+            Err(_) => return ClaudeConnection::LoggedOut,
+        };
+    if !account.logged_in {
+        return ClaudeConnection::LoggedOut;
+    }
+    if let Ok(output) = claude_command(claude, &["--version"]).output() {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        account.needs_update = parse_version(&text).is_some_and(|version| version < MIN_CLAUDE_CODE_VERSION);
+        account.version = text.split_whitespace().next().map(str::to_string);
+    }
+    ClaudeConnection::Connected(account)
+}
+
+fn run_and_wait(mut command: Command, timeout: std::time::Duration) -> Result<(), String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not run Claude Code: {error}"))?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => {
+                let mut detail = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut detail);
+                }
+                let detail = detail.trim().lines().last().unwrap_or("it exited with an error");
+                return Err(format!("Claude Code: {detail}"));
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                return Err("Timed out. Run `claude auth login` in a terminal, then press Refresh."
+                    .to_string());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+            Err(error) => return Err(format!("Claude Code did not finish: {error}")),
+        }
+    }
+}
+
+/// Blocking: runs one `claude` auth or update command, then re-reads the
+/// connection. Run it off the UI thread; a login waits for the browser.
+pub fn run_claude_action_blocking(action: ClaudeAction) -> ClaudeConnection {
+    let Some(claude) = find_claude_cli() else {
+        return ClaudeConnection::NotInstalled;
+    };
+    let result = match action {
+        ClaudeAction::Check => Ok(()),
+        ClaudeAction::Login => run_and_wait(
+            claude_command(&claude, &["auth", "login", "--claudeai"]),
+            LOGIN_TIMEOUT,
+        ),
+        ClaudeAction::Logout => run_and_wait(
+            claude_command(&claude, &["auth", "logout"]),
+            std::time::Duration::from_secs(30),
+        ),
+        ClaudeAction::Update => run_and_wait(
+            claude_command(&claude, &["update"]),
+            std::time::Duration::from_secs(600),
+        ),
+    };
+    match result {
+        Ok(()) => check_connection(&claude),
+        Err(error) => ClaudeConnection::Failed(error),
+    }
+}
+
 fn bundled_sound_effect(id: &str) -> Option<PathBuf> {
     if !SOUND_EFFECTS.iter().any(|(known, _)| *known == id) {
         return None;
