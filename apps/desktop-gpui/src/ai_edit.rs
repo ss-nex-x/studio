@@ -1,9 +1,10 @@
 //! AI auto-edit: hand a recording's word-timed transcript to Claude Opus 5.5
 //! through the user's own Claude Code install (`claude -p`, so it runs on
-//! their Claude login rather than an API key) and apply the returned plan (filler/silence cuts, named chapters, zooms) to
-//! the timeline through the same split/delete/ripple primitives the timeline
-//! itself uses, so every other track stays aligned and the whole pass is one
-//! undo entry.
+//! their Claude login rather than an API key) and apply the returned plan --
+//! cuts, speed-ups, chapters and transitions, zooms, 3D camera moves, scene
+//! layouts, animated titles, background music and sound effects -- through the
+//! editor's own primitives and presets, so every track stays aligned and the
+//! whole pass is one undo entry.
 
 use std::{
     collections::HashMap,
@@ -13,16 +14,57 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use cap_project::{CaptionSegment, ProjectConfiguration, TimelineConfiguration};
+use cap_project::{
+    CaptionSegment, ClipTransition, ClipTransitionType, ProjectConfiguration, SceneMode,
+    TimelineConfiguration, XY,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{editor_edits as edits, editor_timeline};
+use crate::{editor_audio, editor_edits as edits, editor_panels, editor_timeline, store};
 
 pub const MODEL: &str = "claude-opus-5-5";
 const MIN_CUT_SECONDS: f64 = 0.3;
+const MIN_SPEEDUP_SECONDS: f64 = 2.0;
 const MIN_ZOOM_SECONDS: f64 = 1.0;
+const MIN_MOTION_SECONDS: f64 = 2.0;
+const MIN_LAYOUT_SECONDS: f64 = 2.0;
+const MIN_TITLE_SECONDS: f64 = 1.0;
+const TRANSITION_SECONDS: f64 = 0.5;
 const SILENCE_MARKER_SECONDS: f32 = 0.6;
+
+const AI_TEXT_PRESETS: &[&str] = &[
+    "title",
+    "headline",
+    "cinematic",
+    "lower-third",
+    "kicker",
+    "highlight",
+    "neon",
+    "stat",
+    "quote",
+];
+const AI_MOTION_PRESETS: &[&str] = &[
+    "spotlight",
+    "perspective",
+    "close-up",
+    "low-angle",
+    "glide-across",
+    "pull-back",
+    "rising-sweep",
+    "drift-down",
+    "slide-by",
+    "tilt-away",
+];
+/// Bundled in `assets/sfx` (synthesized for Nex X Spark, so no licensing),
+/// with their lengths as a fallback when ffprobe cannot read them.
+const SOUND_EFFECTS: &[(&str, f64)] = &[
+    ("whoosh", 0.7),
+    ("swoosh-out", 0.55),
+    ("pop", 0.16),
+    ("chime", 1.1),
+    ("click", 0.05),
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -59,47 +101,164 @@ pub fn finish(project_path: &Path, result: Result<String, String>) {
     statuses().insert(project_path.to_path_buf(), status);
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct EditPlan {
     pub title: String,
     pub summary: String,
     pub cuts: Vec<TimeRange>,
+    #[serde(default)]
+    pub speedups: Vec<Speedup>,
     pub chapters: Vec<Chapter>,
+    #[serde(default)]
+    pub transition: String,
     pub zooms: Vec<TimeRange>,
+    #[serde(default)]
+    pub titles: Vec<Title>,
+    #[serde(default)]
+    pub motion: Vec<Motion>,
+    #[serde(default)]
+    pub layouts: Vec<Layout>,
+    #[serde(default)]
+    pub music: Music,
+    #[serde(default)]
+    pub sound_effects: Vec<SoundEffect>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct TimeRange {
     pub start: f64,
     pub end: f64,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Chapter {
     pub start: f64,
     pub title: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Speedup {
+    pub start: f64,
+    pub end: f64,
+    pub speed: f64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Title {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    pub preset: String,
+    pub position: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Motion {
+    pub start: f64,
+    pub end: f64,
+    pub preset: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Layout {
+    pub start: f64,
+    pub end: f64,
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Music {
+    pub track: String,
+    pub volume: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SoundEffect {
+    pub time: f64,
+    pub effect: String,
+}
+
+/// Audio files the plan needs, already copied into the project's
+/// `assets/audio` so the project stays self-contained.
+#[derive(Clone, Debug, Default)]
+pub struct AudioAsset {
+    pub path: String,
+    pub name: String,
+    pub duration: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PreparedAssets {
+    pub music: Option<AudioAsset>,
+    pub sound_effects: HashMap<String, AudioAsset>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ApplyReport {
     pub cuts: usize,
+    pub speedups: usize,
     pub chapters: usize,
+    pub transitions: usize,
     pub zooms: usize,
+    pub titles: usize,
+    pub motion: usize,
+    pub layouts: usize,
+    pub music: bool,
+    pub sound_effects: usize,
+}
+
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
 impl ApplyReport {
     pub fn describe(&self, removed_seconds: f64) -> String {
-        format!(
-            "Removed {} pause{} and filler ({:.1}s), named {} chapter{}, added {} zoom{}. Undo reverts all of it.",
-            self.cuts,
-            if self.cuts == 1 { "" } else { "s" },
-            removed_seconds,
-            self.chapters,
-            if self.chapters == 1 { "" } else { "s" },
-            self.zooms,
-            if self.zooms == 1 { "" } else { "s" },
-        )
+        let mut parts = Vec::new();
+        if self.cuts > 0 {
+            parts.push(format!(
+                "cut {} ({removed_seconds:.1}s)",
+                counted(self.cuts, "pause", "pauses")
+            ));
+        }
+        if self.speedups > 0 {
+            parts.push(format!(
+                "sped up {}",
+                counted(self.speedups, "slow part", "slow parts")
+            ));
+        }
+        if self.chapters > 0 {
+            parts.push(format!(
+                "named {}",
+                counted(self.chapters, "chapter", "chapters")
+            ));
+        }
+        if self.transitions > 0 {
+            parts.push(counted(self.transitions, "transition", "transitions"));
+        }
+        if self.zooms > 0 {
+            parts.push(counted(self.zooms, "zoom", "zooms"));
+        }
+        if self.motion > 0 {
+            parts.push(counted(self.motion, "3D camera move", "3D camera moves"));
+        }
+        if self.layouts > 0 {
+            parts.push(counted(self.layouts, "layout change", "layout changes"));
+        }
+        if self.titles > 0 {
+            parts.push(counted(self.titles, "animated title", "animated titles"));
+        }
+        if self.music {
+            parts.push("background music".to_string());
+        }
+        if self.sound_effects > 0 {
+            parts.push(counted(self.sound_effects, "sound effect", "sound effects"));
+        }
+        if parts.is_empty() {
+            "The recording already looks tight; nothing was changed.".to_string()
+        } else {
+            format!("Applied {}. Undo reverts all of it.", parts.join(", "))
+        }
     }
 }
 
@@ -140,26 +299,53 @@ pub fn build_transcript(segments: &[CaptionSegment]) -> String {
     lines.join("\n")
 }
 
-const SYSTEM_PROMPT: &str = "You are the auto-editor inside Nex X Spark, a screen recorder. You \
-receive the word-timed transcript of one screen recording. Times are seconds on the recording's \
-source clock. Each word is written as word@start_time, and <silence a-b> marks a pause between \
-words.
+pub fn edit_context(duration: f64, has_camera: bool) -> String {
+    format!(
+        "Recording length: {duration:.1}s. Webcam track: {}. Captions are shown along the \
+         bottom of the frame.",
+        if has_camera { "yes" } else { "no" }
+    )
+}
 
-Plan an edit that makes the recording tighter and easier to follow without changing what the \
-speaker says:
+const SYSTEM_PROMPT: &str = "You are the auto-editor inside Nex X Spark, a screen recorder. You \
+receive the word-timed transcript of one screen recording and some context about it. Times are \
+seconds on the recording's source clock. Each word is written as word@start_time, and \
+<silence a-b> marks a pause between words.
+
+Plan a complete, polished edit without changing what the speaker says. Use restraint: a clean, \
+professional edit beats a busy one.
 - cuts: remove long pauses, false starts, repeated takes, and filler words (um, uh, like, you \
 know) that add nothing. Keep about 0.15s of breathing room on both sides of speech, never cut \
-inside a word that carries meaning, and do not cut pauses shorter than 0.4s. If the recording is \
-already tight, return few or no cuts.
-- chapters: split the recording into 2 to 8 topic sections with short title-case names (max 5 \
-words). The first chapter starts at the beginning of the first speech.
-- zooms: suggest moments where the speaker points at something specific on screen (\"click \
-here\", \"this button\", \"look at this\"). Each zoom lasts 2 to 6 seconds; zero zooms is fine.
+inside a word that carries meaning, and do not cut pauses shorter than 0.4s.
+- speedups: for long stretches where the speaker is waiting or doing something slow on screen \
+(\"let me type this\", \"waiting for it to load\"), speed the stretch up instead of cutting it. \
+speed is 1.5 to 4. Do not overlap cuts.
+- chapters: 2 to 8 topic sections with short title-case names (max 5 words). The first chapter \
+starts at the beginning of the first speech.
+- transition: how chapters join: \"crossfade\", \"fade_to_black\", or \"none\".
+- zooms: 2 to 6 second zoom-ins where the speaker points at something specific on screen \
+(\"click here\", \"this button\").
+- motion: at most 3 cinematic 3D camera moves (2 to 8 seconds) for big moments such as the \
+intro, a reveal or the final result. Never overlap a zoom.
+- layouts: only when the recording has a webcam. camera_only for a talking intro or outro, \
+split_screen or floating while explaining, hide_camera for detailed screen work. Otherwise \
+return an empty list.
+- titles: an intro title with the recording's title in the first seconds (preset title, \
+cinematic or headline), optional section titles at chapter starts (kicker or lower-third), and \
+short callouts for key numbers or terms (highlight, stat, neon or quote). Text of at most 6 \
+words, shown for 1.5 to 5 seconds. Keep titles away from the bottom of the frame when captions \
+are shown.
+- music: a background track that fits the tone, or \"none\" for serious or very short \
+recordings. volume low unless the recording has little speech.
+- sound_effects: sparse accents, at most one every 10 seconds: whoosh or swoosh-out on chapter \
+changes and camera moves, pop when a title appears, chime for the intro or the final result, \
+click when the speaker clicks something.
 - title: a short title for the whole recording. summary: one or two sentences.
 
 Return only times that exist in the transcript.";
 
 fn plan_schema() -> Value {
+    let string_enum = |values: &[&str]| json!({ "type": "string", "enum": values });
     let range = json!({
         "type": "object",
         "additionalProperties": false,
@@ -170,14 +356,34 @@ fn plan_schema() -> Value {
             "reason": { "type": "string" }
         }
     });
+    let music_tracks: Vec<&str> = std::iter::once("none")
+        .chain(editor_audio::AUDIO_LIBRARY.iter().map(|(id, _)| *id))
+        .collect();
+    let effects: Vec<&str> = SOUND_EFFECTS.iter().map(|(id, _)| *id).collect();
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["title", "summary", "cuts", "chapters", "zooms"],
+        "required": [
+            "title", "summary", "cuts", "speedups", "chapters", "transition", "zooms",
+            "titles", "motion", "layouts", "music", "sound_effects"
+        ],
         "properties": {
             "title": { "type": "string" },
             "summary": { "type": "string" },
             "cuts": { "type": "array", "items": range },
+            "speedups": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["start", "end", "speed"],
+                    "properties": {
+                        "start": { "type": "number" },
+                        "end": { "type": "number" },
+                        "speed": { "type": "number" }
+                    }
+                }
+            },
             "chapters": {
                 "type": "array",
                 "items": {
@@ -190,7 +396,70 @@ fn plan_schema() -> Value {
                     }
                 }
             },
-            "zooms": { "type": "array", "items": range }
+            "transition": string_enum(&["none", "crossfade", "fade_to_black"]),
+            "zooms": { "type": "array", "items": range },
+            "titles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["start", "end", "text", "preset", "position"],
+                    "properties": {
+                        "start": { "type": "number" },
+                        "end": { "type": "number" },
+                        "text": { "type": "string" },
+                        "preset": string_enum(AI_TEXT_PRESETS),
+                        "position": string_enum(&["top", "center", "bottom"])
+                    }
+                }
+            },
+            "motion": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["start", "end", "preset"],
+                    "properties": {
+                        "start": { "type": "number" },
+                        "end": { "type": "number" },
+                        "preset": string_enum(AI_MOTION_PRESETS)
+                    }
+                }
+            },
+            "layouts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["start", "end", "mode"],
+                    "properties": {
+                        "start": { "type": "number" },
+                        "end": { "type": "number" },
+                        "mode": string_enum(&["camera_only", "hide_camera", "split_screen", "floating"])
+                    }
+                }
+            },
+            "music": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["track", "volume"],
+                "properties": {
+                    "track": string_enum(&music_tracks),
+                    "volume": string_enum(&["low", "medium"])
+                }
+            },
+            "sound_effects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["time", "effect"],
+                    "properties": {
+                        "time": { "type": "number" },
+                        "effect": string_enum(&effects)
+                    }
+                }
+            }
         }
     })
 }
@@ -254,7 +523,7 @@ pub fn find_claude_cli() -> Option<PathBuf> {
 /// Blocking: runs one non-interactive Claude Code turn with no tools, no MCP
 /// servers and no saved session, and reads the plan from the structured
 /// output. Run it off the UI thread.
-pub fn request_plan_blocking(transcript: &str) -> Result<EditPlan, String> {
+pub fn request_plan_blocking(transcript: &str, context: &str) -> Result<EditPlan, String> {
     let claude = find_claude_cli().ok_or_else(|| CLAUDE_NOT_FOUND.to_string())?;
     let mut command = Command::new(claude);
     command
@@ -276,7 +545,8 @@ pub fn request_plan_blocking(transcript: &str) -> Result<EditPlan, String> {
         .spawn()
         .map_err(|error| format!("Could not start Claude Code: {error}"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let prompt = format!("<transcript>\n{transcript}\n</transcript>");
+        let prompt =
+            format!("<context>\n{context}\n</context>\n<transcript>\n{transcript}\n</transcript>");
         stdin
             .write_all(prompt.as_bytes())
             .map_err(|error| format!("Could not send the transcript to Claude Code: {error}"))?;
@@ -315,6 +585,69 @@ pub fn parse_cli_output(body: &Value) -> Result<EditPlan, String> {
         })
         .ok_or_else(|| "Claude Code returned no edit plan.".to_string())?;
     serde_json::from_value(plan).map_err(|error| format!("The edit plan was malformed: {error}"))
+}
+
+fn bundled_sound_effect(id: &str) -> Option<PathBuf> {
+    if !SOUND_EFFECTS.iter().any(|(known, _)| *known == id) {
+        return None;
+    }
+    let file = format!("{id}.wav");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    store::bundled_resource_dirs()
+        .into_iter()
+        .map(|directory| directory.join("assets/sfx").join(&file))
+        .chain(std::iter::once(manifest.join("assets/sfx").join(&file)))
+        .find(|path| path.is_file())
+}
+
+fn copy_sound_effect(project_path: &Path, id: &str) -> Option<AudioAsset> {
+    let source = bundled_sound_effect(id)?;
+    let audio_dir = project_path.join("assets").join("audio");
+    std::fs::create_dir_all(&audio_dir).ok()?;
+    let file_name = format!("sfx-{id}.wav");
+    let destination = audio_dir.join(&file_name);
+    if !destination.exists() {
+        std::fs::copy(&source, &destination).ok()?;
+    }
+    let fallback = SOUND_EFFECTS
+        .iter()
+        .find(|(known, _)| *known == id)
+        .map_or(0.5, |(_, duration)| *duration);
+    let probed = editor_audio::probe_audio_duration(&destination);
+    Some(AudioAsset {
+        path: format!("assets/audio/{file_name}"),
+        name: format!("SFX {id}"),
+        duration: if probed > 0.0 { probed } else { fallback },
+    })
+}
+
+/// Blocking file copies for the music and sound effects the plan picked.
+pub fn prepare_assets(project_path: &Path, plan: &EditPlan) -> PreparedAssets {
+    let mut assets = PreparedAssets::default();
+    if let Some((id, label)) = editor_audio::AUDIO_LIBRARY
+        .iter()
+        .find(|(id, _)| *id == plan.music.track)
+    {
+        match editor_audio::copy_library_track(project_path, id, label) {
+            Ok((path, name, duration)) => {
+                assets.music = Some(AudioAsset {
+                    path,
+                    name,
+                    duration,
+                });
+            }
+            Err(error) => tracing::warn!("AI edit could not add music: {error}"),
+        }
+    }
+    for effect in &plan.sound_effects {
+        if assets.sound_effects.contains_key(&effect.effect) {
+            continue;
+        }
+        if let Some(asset) = copy_sound_effect(project_path, &effect.effect) {
+            assets.sound_effects.insert(effect.effect.clone(), asset);
+        }
+    }
+    assets
 }
 
 fn recording_offsets(recording_durations: &[f64]) -> Vec<f64> {
@@ -376,76 +709,183 @@ fn clip_index_starting_at(
     })
 }
 
-fn sanitized_cuts(plan: &EditPlan) -> Vec<(f64, f64)> {
-    let mut cuts: Vec<(f64, f64)> = plan
-        .cuts
-        .iter()
-        .filter(|cut| cut.start.is_finite() && cut.end.is_finite())
-        .map(|cut| (cut.start.max(0.0), cut.end))
-        .filter(|(start, end)| end - start >= MIN_CUT_SECONDS)
+/// Splits the clips so `start..end` (clamped to the clip `start` falls in) is
+/// a clip of its own, and returns its index.
+fn isolate_source_range(
+    timeline: &mut TimelineConfiguration,
+    recording_durations: &[f64],
+    start: f64,
+    end: f64,
+    min_length: f64,
+) -> Option<usize> {
+    let (_, _, clip_source_end) = locate_source_time(timeline, recording_durations, start)?;
+    let end = end.min(clip_source_end);
+    if end - start < min_length {
+        return None;
+    }
+    if clip_source_end - end >= 0.01 {
+        let (output_end, index, _) = locate_source_time(timeline, recording_durations, end)?;
+        if !edits::split_clip_segment(timeline, output_end, Some(index)) {
+            return None;
+        }
+    }
+    let (output_start, index, _) = locate_source_time(timeline, recording_durations, start)?;
+    if clip_index_starting_at(timeline, recording_durations, start).is_none()
+        && !edits::split_clip_segment(timeline, output_start, Some(index))
+    {
+        return None;
+    }
+    clip_index_starting_at(timeline, recording_durations, start)
+}
+
+fn output_range(
+    timeline: &TimelineConfiguration,
+    recording_durations: &[f64],
+    start: f64,
+    end: f64,
+) -> Option<(f64, f64)> {
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return None;
+    }
+    let (output_start, _, _) = locate_source_time(timeline, recording_durations, start)?;
+    let (output_end, _, _) = locate_source_time(timeline, recording_durations, end)?;
+    (output_end > output_start).then_some((output_start, output_end))
+}
+
+fn overlaps_any(ranges: impl IntoIterator<Item = (f64, f64)>, start: f64, end: f64) -> bool {
+    ranges
+        .into_iter()
+        .any(|(other_start, other_end)| other_start < end && start < other_end)
+}
+
+fn free_lane(existing: impl Iterator<Item = (u32, f64, f64)>, start: f64, end: f64) -> u32 {
+    let busy: Vec<u32> = existing
+        .filter(|(_, other_start, other_end)| *other_start < end && start < *other_end)
+        .map(|(lane, _, _)| lane)
         .collect();
-    cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(cuts.len());
-    for cut in cuts {
+    (0..).find(|lane| !busy.contains(lane)).unwrap_or(0)
+}
+
+fn sorted_non_overlapping(mut ranges: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(ranges.len());
+    for range in ranges {
         match merged.last_mut() {
-            Some(last) if cut.0 <= last.1 => last.1 = last.1.max(cut.1),
-            _ => merged.push(cut),
+            Some(last) if range.0 <= last.1 => last.1 = last.1.max(range.1),
+            _ => merged.push(range),
         }
     }
     merged
 }
 
-/// Applies the plan in source time. Cuts go latest-first so the output
-/// positions of the earlier ones are not disturbed before they are made.
-/// Returns what was applied and how many output seconds were removed.
+fn sanitized_cuts(plan: &EditPlan) -> Vec<(f64, f64)> {
+    sorted_non_overlapping(
+        plan.cuts
+            .iter()
+            .filter(|cut| cut.start.is_finite() && cut.end.is_finite())
+            .map(|cut| (cut.start.max(0.0), cut.end))
+            .filter(|(start, end)| end - start >= MIN_CUT_SECONDS)
+            .collect(),
+    )
+}
+
+fn sanitized_speedups(plan: &EditPlan) -> Vec<(f64, f64, f64)> {
+    let mut speedups: Vec<(f64, f64, f64)> = plan
+        .speedups
+        .iter()
+        .filter(|speedup| {
+            speedup.start.is_finite() && speedup.end.is_finite() && speedup.speed.is_finite()
+        })
+        .map(|speedup| {
+            (
+                speedup.start.max(0.0),
+                speedup.end,
+                speedup.speed.clamp(1.25, 4.0),
+            )
+        })
+        .filter(|(start, end, _)| end - start >= MIN_SPEEDUP_SECONDS)
+        .collect();
+    speedups.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut kept: Vec<(f64, f64, f64)> = Vec::with_capacity(speedups.len());
+    for speedup in speedups {
+        if kept.last().is_none_or(|last| speedup.0 >= last.1) {
+            kept.push(speedup);
+        }
+    }
+    kept
+}
+
+fn motion_template(id: &str) -> Option<editor_panels::MotionTemplate> {
+    if !AI_MOTION_PRESETS.contains(&id) {
+        return None;
+    }
+    if let Some(template) = editor_panels::MOTION_TEMPLATES
+        .iter()
+        .find(|template| template.id == id)
+    {
+        return Some(editor_panels::MotionTemplate {
+            id: template.id,
+            name: template.name,
+            from: template.from,
+            to: template.to,
+            blur: template.blur,
+        });
+    }
+    editor_panels::ANGLE_PRESETS
+        .iter()
+        .find(|preset| preset.id == id)
+        .map(editor_panels::angle_preset_motion)
+}
+
+fn has_output_overlays(timeline: &TimelineConfiguration) -> bool {
+    !timeline.transitions.is_empty()
+        || !timeline.zoom_segments.is_empty()
+        || !timeline.scene_segments.is_empty()
+        || !timeline.mask_segments.is_empty()
+        || !timeline.text_segments.is_empty()
+        || !timeline.keyboard_segments.is_empty()
+        || !timeline.audio_segments.is_empty()
+        || !timeline.style_segments.is_empty()
+        || !timeline.image_segments.is_empty()
+        || !timeline.camera3d_segments.is_empty()
+}
+
+/// Applies the plan in source time. Clip edits go latest-first so the output
+/// positions of the earlier ones are not disturbed before they are made, and
+/// every overlay is placed afterwards against the final timeline. Clip
+/// transitions shift everything after them, so they are only added when the
+/// timeline has no overlays yet. Returns what was applied and how many output
+/// seconds the cuts removed.
 pub fn apply_plan(
     project: &mut ProjectConfiguration,
     plan: &EditPlan,
     recording_durations: &[f64],
+    has_camera: bool,
+    assets: &PreparedAssets,
 ) -> (ApplyReport, f64) {
     let mut report = ApplyReport::default();
     let Some(timeline) = project.timeline.as_mut() else {
         return (report, 0.0);
     };
-    let duration_before = edits::clip_timeline_duration(timeline);
+    let can_add_transitions = !has_output_overlays(timeline);
 
-    for (cut_start, cut_end) in sanitized_cuts(plan).into_iter().rev() {
-        let Some((_, _, clip_source_end)) =
-            locate_source_time(timeline, recording_durations, cut_start)
-        else {
-            continue;
-        };
-        let cut_end = cut_end.min(clip_source_end);
-        if cut_end - cut_start < MIN_CUT_SECONDS {
-            continue;
-        }
-        let ends_clip = clip_source_end - cut_end < 0.01;
-        if !ends_clip {
-            let Some((output_end, index, _)) =
-                locate_source_time(timeline, recording_durations, cut_end)
-            else {
-                continue;
-            };
-            if !edits::split_clip_segment(timeline, output_end, Some(index)) {
-                continue;
-            }
-        }
-        let Some((output_start, index, _)) =
-            locate_source_time(timeline, recording_durations, cut_start)
-        else {
-            continue;
-        };
-        if clip_index_starting_at(timeline, recording_durations, cut_start).is_none()
-            && !edits::split_clip_segment(timeline, output_start, Some(index))
+    let duration_before_cuts = edits::clip_timeline_duration(timeline);
+    for (start, end) in sanitized_cuts(plan).into_iter().rev() {
+        if let Some(index) =
+            isolate_source_range(timeline, recording_durations, start, end, MIN_CUT_SECONDS)
+            && edits::delete_clip_segments(timeline, &[index])
         {
-            continue;
-        }
-        let Some(cut_index) = clip_index_starting_at(timeline, recording_durations, cut_start)
-        else {
-            continue;
-        };
-        if edits::delete_clip_segments(timeline, &[cut_index]) {
             report.cuts += 1;
+        }
+    }
+    let removed = (duration_before_cuts - edits::clip_timeline_duration(timeline)).max(0.0);
+
+    for (start, end, speed) in sanitized_speedups(plan).into_iter().rev() {
+        if let Some(index) =
+            isolate_source_range(timeline, recording_durations, start, end, MIN_SPEEDUP_SECONDS)
+            && edits::set_clip_segment_timescale(timeline, index, speed)
+        {
+            report.speedups += 1;
         }
     }
 
@@ -455,7 +895,7 @@ pub fn apply_plan(
         .filter(|chapter| chapter.start.is_finite() && !chapter.title.trim().is_empty())
         .collect();
     chapters.sort_by(|a, b| a.start.total_cmp(&b.start));
-    for chapter in chapters {
+    for chapter in &chapters {
         let Some((output_time, index, _)) =
             locate_source_time(timeline, recording_durations, chapter.start)
         else {
@@ -472,34 +912,219 @@ pub fn apply_plan(
         }
     }
 
-    for zoom in &plan.zooms {
-        if !zoom.start.is_finite() || !zoom.end.is_finite() {
-            continue;
-        }
-        let Some((output_start, _, _)) =
-            locate_source_time(timeline, recording_durations, zoom.start)
-        else {
-            continue;
-        };
-        let Some((output_end, _, _)) = locate_source_time(timeline, recording_durations, zoom.end)
-        else {
-            continue;
-        };
-        if output_end - output_start < MIN_ZOOM_SECONDS {
-            continue;
-        }
-        let overlaps = timeline
-            .zoom_segments
+    let transition_kind = match plan.transition.as_str() {
+        "crossfade" => Some(ClipTransitionType::CrossFade),
+        "fade_to_black" => Some(ClipTransitionType::FadeThroughBlack),
+        _ => None,
+    };
+    if can_add_transitions && let Some(kind) = transition_kind {
+        let mut boundaries: Vec<usize> = chapters
             .iter()
-            .any(|existing| existing.start < output_end && output_start < existing.end);
-        if overlaps {
+            .filter_map(|chapter| {
+                clip_index_starting_at(timeline, recording_durations, chapter.start)
+            })
+            .filter(|index| *index > 0)
+            .collect();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for index in boundaries {
+            timeline.transitions.push(ClipTransition {
+                segment_index: index as u32,
+                kind,
+                duration: TRANSITION_SECONDS,
+            });
+            report.transitions += 1;
+        }
+        timeline
+            .transitions
+            .sort_by_key(|transition| transition.segment_index);
+    }
+
+    for zoom in &plan.zooms {
+        let Some((start, end)) = output_range(timeline, recording_durations, zoom.start, zoom.end)
+        else {
+            continue;
+        };
+        if end - start < MIN_ZOOM_SECONDS
+            || overlaps_any(
+                timeline.zoom_segments.iter().map(|zoom| (zoom.start, zoom.end)),
+                start,
+                end,
+            )
+        {
             continue;
         }
-        edits::insert_zoom_segment(timeline, output_start, output_end, edits::DEFAULT_ZOOM_AMOUNT);
+        edits::insert_zoom_segment(timeline, start, end, edits::DEFAULT_ZOOM_AMOUNT);
         report.zooms += 1;
     }
 
-    let removed = (duration_before - edits::clip_timeline_duration(timeline)).max(0.0);
+    for motion in &plan.motion {
+        let Some((start, end)) =
+            output_range(timeline, recording_durations, motion.start, motion.end)
+        else {
+            continue;
+        };
+        let Some(template) = motion_template(&motion.preset) else {
+            continue;
+        };
+        let busy = timeline
+            .camera3d_segments
+            .iter()
+            .map(|shot| (shot.start, shot.end))
+            .chain(timeline.zoom_segments.iter().map(|zoom| (zoom.start, zoom.end)));
+        if end - start < MIN_MOTION_SECONDS || overlaps_any(busy, start, end) {
+            continue;
+        }
+        let mut segment = edits::default_camera3d_segment(start, end);
+        editor_panels::apply_motion_template(&mut segment, &template);
+        edits::insert_camera3d_segment(timeline, segment);
+        report.motion += 1;
+    }
+
+    if has_camera {
+        for layout in &plan.layouts {
+            let mode = match layout.mode.as_str() {
+                "camera_only" => SceneMode::CameraOnly,
+                "hide_camera" => SceneMode::HideCamera,
+                "split_screen" => SceneMode::SplitScreen,
+                "floating" => SceneMode::Floating,
+                _ => continue,
+            };
+            let Some((start, end)) =
+                output_range(timeline, recording_durations, layout.start, layout.end)
+            else {
+                continue;
+            };
+            if end - start < MIN_LAYOUT_SECONDS
+                || overlaps_any(
+                    timeline
+                        .scene_segments
+                        .iter()
+                        .map(|scene| (scene.start, scene.end)),
+                    start,
+                    end,
+                )
+            {
+                continue;
+            }
+            let mut segment = edits::default_scene_segment(start, end);
+            segment.mode = mode;
+            edits::insert_scene_segment(timeline, segment);
+            report.layouts += 1;
+        }
+    }
+
+    let installed = editor_panels::installed_fonts();
+    for title in &plan.titles {
+        let text = title.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Some(preset) = editor_panels::TEXT_PRESETS
+            .iter()
+            .find(|preset| preset.id == title.preset && AI_TEXT_PRESETS.contains(&preset.id))
+        else {
+            continue;
+        };
+        let Some((start, end)) =
+            output_range(timeline, recording_durations, title.start, title.end)
+        else {
+            continue;
+        };
+        if end - start < MIN_TITLE_SECONDS {
+            continue;
+        }
+        let lane = free_lane(
+            timeline
+                .text_segments
+                .iter()
+                .map(|segment| (segment.track, segment.start, segment.end)),
+            start,
+            end,
+        );
+        let mut segment = edits::default_text_segment(start, end, lane);
+        segment.content = text.to_string();
+        segment.size = XY::new(0.5, 0.09);
+        editor_panels::apply_text_preset(&mut segment, preset, installed);
+        if preset.center.is_none() {
+            segment.center = match title.position.as_str() {
+                "top" => XY::new(0.5, 0.16),
+                "bottom" => XY::new(0.5, 0.8),
+                _ => XY::new(0.5, 0.5),
+            };
+        }
+        edits::insert_text_segment(timeline, segment);
+        report.titles += 1;
+    }
+
+    let total = edits::clip_timeline_duration(timeline);
+    if let Some(music) = &assets.music
+        && total > 1.0
+    {
+        let lane = edits::used_lane_count(&timeline.audio_segments);
+        let end = if music.duration > 0.0 {
+            total.min(music.duration)
+        } else {
+            total
+        };
+        let mut segment = edits::default_audio_segment(
+            0.0,
+            end,
+            lane,
+            music.path.clone(),
+            music.name.clone(),
+            (music.duration > 0.0).then_some(music.duration),
+        );
+        segment.volume_db = if plan.music.volume == "medium" {
+            -14.0
+        } else {
+            -20.0
+        };
+        segment.fade_in = 1.5_f64.min(end / 4.0);
+        segment.fade_out = 2.5_f64.min(end / 4.0);
+        edits::insert_audio_segment(timeline, segment);
+        report.music = true;
+    }
+
+    let effects_lane = edits::used_lane_count(&timeline.audio_segments);
+    for effect in &plan.sound_effects {
+        let Some(asset) = assets.sound_effects.get(&effect.effect) else {
+            continue;
+        };
+        if !effect.time.is_finite() {
+            continue;
+        }
+        let Some((start, _, _)) = locate_source_time(timeline, recording_durations, effect.time)
+        else {
+            continue;
+        };
+        let end = (start + asset.duration).min(total);
+        if end - start < 0.03
+            || overlaps_any(
+                timeline
+                    .audio_segments
+                    .iter()
+                    .filter(|segment| segment.track == effects_lane)
+                    .map(|segment| (segment.start, segment.end)),
+                start,
+                end,
+            )
+        {
+            continue;
+        }
+        let mut segment = edits::default_audio_segment(
+            start,
+            end,
+            effects_lane,
+            asset.path.clone(),
+            asset.name.clone(),
+            Some(asset.duration),
+        );
+        segment.volume_db = -8.0;
+        edits::insert_audio_segment(timeline, segment);
+        report.sound_effects += 1;
+    }
+
     (report, removed)
 }
 
@@ -558,6 +1183,13 @@ mod tests {
         }
     }
 
+    fn chapter(start: f64, title: &str) -> Chapter {
+        Chapter {
+            start,
+            title: title.into(),
+        }
+    }
+
     #[test]
     fn transcript_marks_silences_between_words() {
         let segments = vec![CaptionSegment {
@@ -588,22 +1220,13 @@ mod tests {
     fn cuts_remove_time_and_chapters_name_clips() {
         let mut project = project(30.0);
         let plan = EditPlan {
-            title: String::new(),
-            summary: String::new(),
             cuts: vec![range(5.0, 7.0), range(20.0, 21.0), range(10.0, 10.1)],
-            chapters: vec![
-                Chapter {
-                    start: 0.0,
-                    title: "Intro".into(),
-                },
-                Chapter {
-                    start: 15.0,
-                    title: "Demo".into(),
-                },
-            ],
+            chapters: vec![chapter(0.0, "Intro"), chapter(15.0, "Demo")],
             zooms: vec![range(16.0, 19.0)],
+            ..EditPlan::default()
         };
-        let (report, removed) = apply_plan(&mut project, &plan, &[30.0]);
+        let (report, removed) =
+            apply_plan(&mut project, &plan, &[30.0], false, &PreparedAssets::default());
         let timeline = project.timeline.as_ref().unwrap();
         assert_eq!(report.cuts, 2);
         assert!((removed - 3.0).abs() < 1e-6);
@@ -619,6 +1242,116 @@ mod tests {
         assert_eq!(report.zooms, 1);
         assert!((timeline.zoom_segments[0].start - 14.0).abs() < 1e-6);
         assert!((timeline.zoom_segments[0].end - 17.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn speedups_shorten_the_timeline_and_transitions_join_chapters() {
+        let mut project = project(40.0);
+        let plan = EditPlan {
+            speedups: vec![Speedup {
+                start: 10.0,
+                end: 20.0,
+                speed: 2.0,
+            }],
+            chapters: vec![chapter(0.0, "Intro"), chapter(25.0, "Result")],
+            transition: "crossfade".into(),
+            ..EditPlan::default()
+        };
+        let (report, _) =
+            apply_plan(&mut project, &plan, &[40.0], false, &PreparedAssets::default());
+        let timeline = project.timeline.as_ref().unwrap();
+        assert_eq!(report.speedups, 1);
+        assert_eq!(report.transitions, 1);
+        assert_eq!(timeline.transitions.len(), 1);
+        let expected = 40.0 - 5.0 - TRANSITION_SECONDS;
+        assert!((edits::clip_timeline_duration(timeline) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn titles_layouts_and_sound_are_placed_on_the_final_timeline() {
+        let mut project = project(30.0);
+        let mut assets = PreparedAssets::default();
+        assets.sound_effects.insert(
+            "pop".into(),
+            AudioAsset {
+                path: "assets/audio/sfx-pop.wav".into(),
+                name: "SFX pop".into(),
+                duration: 0.16,
+            },
+        );
+        assets.music = Some(AudioAsset {
+            path: "assets/audio/library-lofi-beats-mirostar.mp3".into(),
+            name: "Lofi Beats".into(),
+            duration: 120.0,
+        });
+        let plan = EditPlan {
+            cuts: vec![range(2.0, 4.0)],
+            titles: vec![Title {
+                start: 5.0,
+                end: 8.0,
+                text: "Getting Started".into(),
+                preset: "title".into(),
+                position: "top".into(),
+            }],
+            layouts: vec![Layout {
+                start: 10.0,
+                end: 15.0,
+                mode: "split_screen".into(),
+            }],
+            music: Music {
+                track: "lofi-beats-mirostar".into(),
+                volume: "low".into(),
+            },
+            sound_effects: vec![SoundEffect {
+                time: 5.0,
+                effect: "pop".into(),
+            }],
+            ..EditPlan::default()
+        };
+        let (report, _) = apply_plan(&mut project, &plan, &[30.0], true, &assets);
+        let timeline = project.timeline.as_ref().unwrap();
+        assert_eq!(report.titles, 1);
+        assert_eq!(timeline.text_segments[0].content, "Getting Started");
+        assert!((timeline.text_segments[0].start - 3.0).abs() < 1e-6);
+        assert_eq!(report.layouts, 1);
+        assert!(matches!(timeline.scene_segments[0].mode, SceneMode::SplitScreen));
+        assert!(report.music);
+        assert_eq!(report.sound_effects, 1);
+        assert_eq!(timeline.audio_segments.len(), 2);
+        let effect = timeline
+            .audio_segments
+            .iter()
+            .find(|segment| segment.path.ends_with("sfx-pop.wav"))
+            .unwrap();
+        assert!((effect.start - 3.0).abs() < 1e-6);
+        let music = timeline
+            .audio_segments
+            .iter()
+            .find(|segment| segment.path.ends_with(".mp3"))
+            .unwrap();
+        assert_ne!(music.track, effect.track);
+        assert!((music.end - 28.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn layouts_need_a_camera_and_unknown_presets_are_ignored() {
+        let mut project = project(20.0);
+        let plan = EditPlan {
+            layouts: vec![Layout {
+                start: 2.0,
+                end: 8.0,
+                mode: "camera_only".into(),
+            }],
+            motion: vec![Motion {
+                start: 2.0,
+                end: 8.0,
+                preset: "not-a-preset".into(),
+            }],
+            ..EditPlan::default()
+        };
+        let (report, _) =
+            apply_plan(&mut project, &plan, &[20.0], false, &PreparedAssets::default());
+        assert_eq!(report, ApplyReport::default());
     }
 
     #[test]

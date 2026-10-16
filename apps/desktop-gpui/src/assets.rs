@@ -169,6 +169,7 @@ const ICONS: &[(&str, &[u8])] = assets!("icons":
     "gem.svg",
     "sliders-horizontal.svg",
     "zap.svg",
+    "sparkles.svg",
     "zoom-in.svg",
     "zoom-out.svg",
     // The settings Recordings page. `link` is Cap's own

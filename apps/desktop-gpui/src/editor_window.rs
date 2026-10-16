@@ -9399,6 +9399,7 @@ impl EditorWindow {
                     .when(!crate::LOCAL_ONLY && self.sharing.is_some(), |group| {
                         group.child(self.render_reupload_button(cx))
                     })
+                    .child(self.render_ai_edit_button(cx))
                     .child(self.render_export_button(cx))
                     .relative()
                     .children((!self.visual_ready()).then(|| {
@@ -9451,6 +9452,19 @@ impl EditorWindow {
 
     /// The Export button: the one primary control in the editor, a vertical
     /// `accent-2 -> accent` gradient with a 1px top highlight.
+    fn render_ai_edit_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let running =
+            crate::ai_edit::status(&self.project_path) == Some(crate::ai_edit::Status::Running);
+        ui::EditorButton::plain(&self.theme, "editor-ai-edit")
+            .left_icon("icons/sparkles.svg")
+            .label(if running { "AI Editing..." } else { "AI Edit" })
+            .tooltip(&self.theme, "Edit the whole video with Claude Opus 5.5")
+            .disabled(running || !self.project_ready())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.ai_edit_clicked(window, cx);
+            }))
+    }
+
     fn render_export_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.theme.editor;
         let gradient = |top: gpui::Rgba, bottom: gpui::Rgba| {

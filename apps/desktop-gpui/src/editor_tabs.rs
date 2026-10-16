@@ -2905,8 +2905,9 @@ impl EditorWindow {
         let running = status == Some(ai_edit::Status::Running);
         let hint = if has_captions {
             format!(
-                "Runs Opus 5.5 ({}) on your Claude Code login to remove pauses and filler, name \
-                 chapters and add zooms.",
+                "Opus 5.5 ({}) edits the whole video on your Claude Code login: cuts and \
+                 speed-ups, chapters and transitions, zooms and 3D camera moves, layouts, \
+                 animated titles, music and sound effects.",
                 ai_edit::MODEL
             )
         } else {
@@ -2921,7 +2922,7 @@ impl EditorWindow {
                     .text_size(px(13.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(Hsla::from(theme.gray_12))
-                    .child("AI Edit"),
+                    .child("AI Video Edit"),
             )
             .child(
                 div()
@@ -2969,16 +2970,30 @@ impl EditorWindow {
         column
     }
 
-    fn ai_edit_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn ai_edit_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(summary) = self.summary() else {
             return;
         };
         let recording_durations = summary.clip_display_durations.clone();
+        let has_camera = summary.has_camera;
         let segments = ai_edit::source_timed_segments(&self.project, &recording_durations);
         if segments.is_empty() {
+            ai_edit::finish(
+                &self.project_path,
+                Err("Generate captions first, then run the AI edit: it reads the transcript."
+                    .to_string()),
+            );
+            self.sidebar.tab = crate::editor_sidebar::SidebarTab::Captions;
+            cx.notify();
             return;
         }
         let transcript = ai_edit::build_transcript(&segments);
+        let duration = self
+            .project
+            .timeline
+            .as_ref()
+            .map_or(0.0, crate::editor_edits::clip_timeline_duration);
+        let context = ai_edit::edit_context(duration, has_camera);
         let project_path = self.project_path.clone();
         if !ai_edit::begin(&project_path) {
             return;
@@ -2986,24 +3001,41 @@ impl EditorWindow {
         cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
+            let task_path = project_path.clone();
             let task = gpui_tokio::Tokio::spawn(cx, async move {
-                tokio::task::spawn_blocking(move || ai_edit::request_plan_blocking(&transcript))
-                    .await
-                    .map_err(|error| format!("AI edit task panicked: {error}"))?
+                tokio::task::spawn_blocking(move || {
+                    let plan = ai_edit::request_plan_blocking(&transcript, &context)?;
+                    let assets = ai_edit::prepare_assets(&task_path, &plan);
+                    Ok::<_, String>((plan, assets))
+                })
+                .await
+                .map_err(|error| format!("AI edit task panicked: {error}"))?
             });
             let result = match task.await {
                 Ok(result) => result,
                 Err(error) => Err(format!("AI edit task failed: {error}")),
             };
             match result {
-                Ok(plan) => {
+                Ok((plan, assets)) => {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let mut outcome = (ai_edit::ApplyReport::default(), 0.0);
                         let durations = recording_durations.clone();
                         this.edit_project("ai-edit", window, cx, |project| {
-                            outcome = ai_edit::apply_plan(project, &plan, &durations);
+                            outcome = ai_edit::apply_plan(
+                                project,
+                                &plan,
+                                &durations,
+                                has_camera,
+                                &assets,
+                            );
                             outcome.0 != ai_edit::ApplyReport::default()
                         });
+                        let lanes =
+                            crate::editor_timeline::TrackLanes::from_project(&this.project, has_camera);
+                        this.tracks.text = this.tracks.text.max(lanes.text);
+                        this.tracks.audio = this.tracks.audio.max(lanes.audio);
+                        this.tracks.scene |= lanes.scene;
+                        this.tracks.three_d |= lanes.three_d;
                         let (report, removed) = outcome;
                         ai_edit::finish(
                             &project_path,
